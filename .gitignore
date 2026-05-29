@@ -1,0 +1,12 @@
+# Design and internal notes — kept out of the public repo
+BOUND_CONTEXT.md
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.vscode/
+.idea/
+*.tmp

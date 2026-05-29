@@ -1,0 +1,4327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BOUND</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..600&family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#060810;font-family:'IBM Plex Mono',ui-monospace,monospace;color:#e8ebf2;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+canvas{display:block;position:absolute;inset:0;touch-action:none}
+.grain{position:fixed;inset:0;pointer-events:none;z-index:5;opacity:.05;mix-blend-mode:screen;
+ background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>")}
+.vignette{position:fixed;inset:0;pointer-events:none;z-index:4;background:radial-gradient(ellipse at center,transparent 35%,rgba(0,0,0,.7) 100%)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="grain"></div>
+<div class="vignette"></div>
+<script>
+"use strict";
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let DPR = Math.min(window.devicePixelRatio||1, 2);
+let W=0, H=0, CX=0, CY=0;
+
+function resize(){
+  W = window.innerWidth; H = window.innerHeight;
+  CX = W/2; CY = H/2;
+  canvas.width = W*DPR; canvas.height = H*DPR;
+  canvas.style.width = W+'px'; canvas.style.height = H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+resize();
+addEventListener('resize', resize);
+
+// ===== util =====
+const TAU = Math.PI*2;
+const rand = (a,b)=>a+Math.random()*(b-a);
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp = (a,b,t)=>a+(b-a)*t;
+const dist = (x1,y1,x2,y2)=>Math.hypot(x2-x1,y2-y1);
+
+// ===== starfield =====
+const stars = [];
+for(let i=0;i<260;i++){
+  stars.push({x:Math.random(), y:Math.random(), r:rand(.3,1.6), tw:rand(0,TAU), sp:rand(.4,2.2), p:rand(.2,1)});
+}
+
+// ===== meta (persistent) =====
+const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], gyroEnabled:false, prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30 };
+let meta = {...META_DEFAULT, owned:{}};
+function loadMeta(){
+  try{
+    const s = localStorage.getItem('bound_meta_v2');
+    if (s){
+      const d = JSON.parse(s);
+      meta = {
+        ...META_DEFAULT,
+        ...d,
+        owned: d.owned || {},
+        seenOrbs: d.seenOrbs || {},
+        passives: d.passives || {},
+        equipped: d.equipped || [],
+      };
+    }
+  }catch{}
+}
+function saveMeta(){
+  try{ localStorage.setItem('bound_meta_v2', JSON.stringify(meta)); }catch{}
+}
+loadMeta();
+
+// ===== meta upgrades =====
+const META_UPGRADES = [
+  { id:'vitality',  title:'VITALITY',   desc:'Maximum integrity +1',
+    costs:[150, 340, 620], symbol:'+',
+    apply:(p,a,g)=>{ p.maxHp += 1; } },
+  { id:'voidspace', title:'VOIDSPACE',  desc:'+arena radius · +6% enemy spawns per level',
+    costs:[130, 270, 480, 740], symbol:'○',
+    apply:(p,a,g,lvl)=>{
+      const gains=[20,18,15,12];
+      a.radius += gains[lvl]||10;
+      g.spawnRateMult = (g.spawnRateMult||1) + 0.06;
+    } },
+  { id:'swiftness', title:'SWIFTNESS',  desc:'Movement speed +12%',
+    costs:[150, 280, 440, 640, 880], symbol:'»',
+    apply:(p,a,g)=>{ p.speed *= 1.12; } },
+  { id:'compact',   title:'COMPACT',    desc:'Hitbox −12%',
+    costs:[170, 310, 480, 690, 940], symbol:'◌',
+    apply:(p,a,g)=>{ p.baseRadius *= 0.88; p.radius = p.baseRadius; } },
+  { id:'aegis',     title:'AEGIS',      desc:'Invulnerability after damage +0.35s',
+    costs:[180, 320, 500, 720], symbol:'△',
+    apply:(p,a,g)=>{ g.iframeBonus += 0.35; } },
+  { id:'profit',    title:'PROFIT',     desc:'Score gained +18%',
+    costs:[200, 360, 560, 800], symbol:'∎',
+    apply:(p,a,g)=>{ g.scoreMult *= 1.18; } },
+  { id:'mending',   title:'MENDING',    desc:'Heal 1 at 20s mark · level 2 adds 10s',
+    costs:[400, 700], symbol:'✛',
+    apply:(p,a,g)=>{ g.mendingLevel = (g.mendingLevel||0) + 1; } },
+];
+
+// ===== passives (essence-funded triggered effects) =====
+// Each passive has 3 levels. Costs are in essence.
+// Levels stored in meta.passives[id] (0 = not owned, 1-3 = level).
+// Equipped via meta.equipped[] (array of up to MAX_SLOTS ids).
+const MAX_SLOTS = 3;
+const PASSIVES = [
+  {
+    id:'slipstream', title:'SLIPSTREAM', symbol:'≈',
+    desc:level => `Every ${[8,7,6][level-1]}s, hitbox −30% for ${[2.0,2.5,3.0][level-1]}s`,
+    short:'time-triggered shrink',
+    levels:[
+      { label:'interval', values:['8s', '7s', '6s'] },
+      { label:'duration', values:['2.0s', '2.5s', '3.0s'] },
+    ],
+    costs:[10, 20, 34],
+  },
+  {
+    id:'magnet', title:'MAGNET', symbol:'⊙',
+    desc:level => `Orbs within ${[60,90,130][level-1]}px drift toward you`,
+    short:'orb attractor',
+    levels:[
+      { label:'range', values:['60px', '90px', '130px'] },
+    ],
+    costs:[10, 20, 34],
+  },
+  {
+    id:'phoenix', title:'PHOENIX', symbol:'✦',
+    desc:level => `On first death, revert to ${[1,2,2][level-1]} HP with ${[1.5,2.0,2.5][level-1]}s invulnerability`,
+    short:'one revive per run',
+    levels:[
+      { label:'revive HP', values:['1', '2', '2'] },
+      { label:'invuln',    values:['1.5s', '2.0s', '2.5s'] },
+    ],
+    costs:[12, 22, 40],
+  },
+  {
+    id:'resonance', title:'RESONANCE', symbol:'◈',
+    desc:level => `At combo ≥×1.5, +${[10,14,18][level-1]}% movement speed`,
+    short:'combo speed boost',
+    levels:[
+      { label:'speed', values:['+10%', '+14%', '+18%'] },
+    ],
+    costs:[10, 20, 34],
+  },
+  {
+    id:'edge', title:'EDGE', symbol:'⌁',
+    desc:level => `Every ${[5,4,3][level-1]} close calls, slow enemies for ${[0.6,0.7,0.9][level-1]}s`,
+    short:'near-miss slow-mo',
+    levels:[
+      { label:'threshold', values:['5', '4', '3'] },
+      { label:'slow',      values:['0.6s', '0.7s', '0.9s'] },
+    ],
+    costs:[12, 22, 40],
+  },
+  {
+    id:'pulse', title:'PULSE', symbol:'◉',
+    desc:level => `Every ${[12,10,8][level-1]}s, push nearby enemies outward`,
+    short:'shockwave reset',
+    levels:[
+      { label:'interval', values:['12s', '10s', '8s'] },
+      { label:'range',    values:['120px', '140px', '160px'] },
+    ],
+    costs:[10, 20, 34],
+  },
+  {
+    id:'crystal', title:'CRYSTAL', symbol:'◇',
+    desc:level => [
+      'At combo ≥×2.0, the next hit is ignored',
+      'At combo ≥×1.5, the next hit is ignored',
+      'At combo ≥×1.5, the next 2 hits are ignored',
+    ][level-1],
+    short:'combo-charged shield',
+    levels:[
+      { label:'combo req', values:['×2.0', '×1.5', '×1.5'] },
+      { label:'hits',      values:['1', '1', '2'] },
+    ],
+    costs:[12, 22, 40],
+  },
+  {
+    id:'echo', title:'ECHO', symbol:'❉',
+    desc:level => `Picking up an orb leaves a ${[1.5,2.0,2.5][level-1]}s afterimage that absorbs a hit`,
+    short:'orb-pickup decoy',
+    levels:[
+      { label:'duration', values:['1.5s', '2.0s', '2.5s'] },
+    ],
+    costs:[10, 20, 34],
+  },
+  {
+    id:'greed', title:'GREED', symbol:'¤',
+    desc:level => `Every ${[100,75,50][level-1]} score, drop a 1-essence sparkle`,
+    short:'score-driven essence',
+    levels:[
+      { label:'every', values:['100 sc', '75 sc', '50 sc'] },
+    ],
+    costs:[10, 20, 34],
+  },
+];
+const PASSIVE_BY_ID = Object.fromEntries(PASSIVES.map(p => [p.id, p]));
+
+function passiveLevel(id){ return (meta.passives && meta.passives[id]) || 0; }
+function passiveOwned(id){ return passiveLevel(id) > 0; }
+function passiveEquipped(id){ return (meta.equipped || []).includes(id); }
+function activePassiveLevel(id){
+  if (game.modifierNoPassives) return 0;
+  return passiveEquipped(id) ? passiveLevel(id) : 0;
+}
+function nextPassiveCost(p){ return p.costs[passiveLevel(p.id)] ?? null; }
+function isPassiveMaxed(p){ return passiveLevel(p.id) >= p.costs.length; }
+function canAffordPassive(p){
+  const c = nextPassiveCost(p);
+  return c !== null && (meta.totalEssence || 0) >= c;
+}
+
+function buyPassive(p){
+  if (isPassiveMaxed(p) || !canAffordPassive(p)) return false;
+  meta.totalEssence -= nextPassiveCost(p);
+  meta.passives = meta.passives || {};
+  meta.passives[p.id] = passiveLevel(p.id) + 1;
+  // auto-equip on first purchase if a slot is open
+  meta.equipped = meta.equipped || [];
+  if (passiveLevel(p.id) === 1 && meta.equipped.length < MAX_SLOTS && !meta.equipped.includes(p.id)){
+    meta.equipped.push(p.id);
+  }
+  saveMeta();
+  return true;
+}
+
+function toggleEquip(id){
+  meta.equipped = meta.equipped || [];
+  const idx = meta.equipped.indexOf(id);
+  if (idx >= 0){
+    meta.equipped.splice(idx, 1);
+  } else if (meta.equipped.length < MAX_SLOTS){
+    meta.equipped.push(id);
+  }
+  saveMeta();
+}
+
+function equipInSlot(slot, id){
+  meta.equipped = meta.equipped || [];
+  // remove id from any other slot first
+  const existing = meta.equipped.indexOf(id);
+  if (existing >= 0) meta.equipped.splice(existing, 1);
+  // place at slot (extending if needed)
+  meta.equipped[slot] = id;
+  // compact array: drop holes
+  meta.equipped = meta.equipped.filter(x => x);
+  saveMeta();
+}
+
+function unequipSlot(slot){
+  meta.equipped = meta.equipped || [];
+  meta.equipped.splice(slot, 1);
+  saveMeta();
+}
+
+
+function levelOf(id){ return meta.owned[id] || 0; }
+function nextCost(u){ return u.costs[levelOf(u.id)] ?? null; }
+function isMaxed(u){ return levelOf(u.id) >= u.costs.length; }
+function canAfford(u){ const c = nextCost(u); return c!==null && meta.totalScore >= c; }
+
+function buyUpgrade(u){
+  if (isMaxed(u) || !canAfford(u)) return false;
+  meta.totalScore -= nextCost(u);
+  meta.owned[u.id] = levelOf(u.id) + 1;
+  saveMeta();
+  return true;
+}
+
+function applyMetaUpgrades(player, arena, opts){
+  for (const u of META_UPGRADES){
+    const lvl = levelOf(u.id);
+    for (let i=0;i<lvl;i++) u.apply(player, arena, opts);
+  }
+  player.hp = player.maxHp;
+  player.displayHp = 1;
+}
+
+function tryReset(){
+  if (game.resetState === 1){
+    // confirmed — wipe progression but preserve user preferences (gyro toggle)
+    const keepGyro = meta.gyroEnabled || false;
+    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{}, gyroEnabled:keepGyro };
+    saveMeta();
+    game.resetState = 0;
+    game.resetTimer = 0;
+    game.shopMsg = 'Progression wiped · clean slate.';
+    game.shopMsgTimer = 2.5;
+    ringBurst(CX, CY, '#ff6b8a', 22);
+    shopUI.scroll = 0;
+  } else {
+    game.resetState = 1;
+    game.resetTimer = 3;
+  }
+}
+
+// ===== prestige =====
+// Score multiplier curve: soft cap at 2.10x, big early gains, asymptote prevents
+// infinite grinding from feeling mandatory. Steep slope through prestige 6 keeps
+// the unlock-tier ladder (3/6/9/12/15) interesting.
+function prestigeCurve(p){
+  return 1 + 0.10 * (1 - Math.pow(0.92, p));
+}
+
+function totalStatLevels(){
+  let total = 0;
+  for (const id in (meta.owned || {})) total += meta.owned[id] || 0;
+  return total;
+}
+
+// First ascension requires 12 stat levels owned (~44% upgrade saturation).
+// After that, always available — no need to re-earn the right to ascend.
+function canAscend(){
+  if (game.scene === 'playing') return false;
+  if ((meta.prestige || 0) === 0) return totalStatLevels() >= 12;
+  return true;
+}
+
+function ascend(){
+  if (!canAscend()) return false;
+  meta.prestige = (meta.prestige || 0) + 1;
+  meta.prestigeMult = prestigeCurve(meta.prestige);
+  meta.owned = {};            // wipe stat upgrades
+  meta.totalScore = 0;        // wipe banked score
+  meta.seenAscensionBanner = true;  // dismiss banner if it was up
+  saveMeta();
+  // celebratory feedback — a moment of "you did something significant"
+  game.ascendAnim = 1.5;
+  ringBurst(CX, CY, '#facc15', 36);
+  burst(CX, CY, '#facc15', 24, 3);
+  burst(CX, CY, '#ffffff', 16, 2.2);
+  game.flash = 0.5;
+  game.flashColor = '#facc15';
+  // close any modals
+  shopUI.ascendConfirm = false;
+  shopUI.scroll = 0;
+  return true;
+}
+
+// arena radius (single source of truth — both initial state and startRun() reference this)
+const BASE_ARENA_RADIUS = 96;
+
+// ===== modifiers (per-run challenge modifiers, unlocked at prestige 9) =====
+// Each modifier: id, title, desc, category, scoreMult, apply(game) hook applied at startRun.
+// Some modifiers also set runtime flags read at integration points (spawnEnemy, updateOrbs,
+// damagePlayer, activePassiveLevel). Score multiplier stacks multiplicatively with prestigeMult.
+const MODIFIERS = [
+  { id:'drifter_storm', title:'DRIFTER  STORM', desc:'Only drifters spawn. +50% spawn rate.',
+    category:'CONTENT', scoreMult:1.3,
+    apply(g){ g.modifierEnemyFilter = ['drifter']; g.modifierSpawnMult = 1.5; } },
+  { id:'hunters', title:'HUNTERS', desc:'Only trackers and snipers. Track from second one.',
+    category:'CONTENT', scoreMult:1.4,
+    apply(g){ g.modifierEnemyFilter = ['tracker','sniper']; } },
+  { id:'big_pieces', title:'BIG  PIECES', desc:'Only brutes. Slow but huge.',
+    category:'CONTENT', scoreMult:1.5,
+    apply(g){ g.modifierEnemyFilter = ['brute']; } },
+  { id:'shatter', title:'SHATTER', desc:'Only splitters. Density cap raised to 16.',
+    category:'CONTENT', scoreMult:1.6,
+    apply(g){ g.modifierEnemyFilter = ['splitter']; g.modifierMaxDensity = 16; } },
+
+  { id:'tight_quarters', title:'TIGHT  QUARTERS', desc:'Arena radius −25%. Less room to move.',
+    category:'SPATIAL', scoreMult:1.5,
+    apply(g){ g.arena.radius = Math.floor(BASE_ARENA_RADIUS * 0.75); } },
+  { id:'vast_expanse', title:'VAST  EXPANSE', desc:'Arena radius +35%. Spawn rate +30%.',
+    category:'SPATIAL', scoreMult:1.0,
+    apply(g){ g.arena.radius = Math.floor(BASE_ARENA_RADIUS * 1.35); g.modifierSpawnMult = 1.3; } },
+
+  { id:'flood', title:'FLOOD', desc:'Enemies +30% speed. Density cap reduced to 9.',
+    category:'TEMPO', scoreMult:1.5,
+    apply(g){ g.modifierEnemySpeedMult = 1.30; g.modifierMaxDensity = 9; } },
+
+  { id:'famine', title:'FAMINE', desc:'Orbs only spawn in the last 10 seconds.',
+    category:'ECONOMY', scoreMult:1.6,
+    apply(g){ g.modifierOrbBlock = true; } },
+
+  { id:'glass', title:'GLASS', desc:'One health. First hit ends the run.',
+    category:'CHALLENGE', scoreMult:3.0,
+    apply(g){ g.modifierGlass = true; g.player.maxHp = 1; g.player.hp = 1; g.player.displayHp = 1; } },
+  { id:'no_passives', title:'NO  PASSIVES', desc:'Passive abilities disabled this run.',
+    category:'CHALLENGE', scoreMult:1.8,
+    apply(g){ g.modifierNoPassives = true; } },
+
+  // CONTENT additions for the new enemy types — only spawn when picked.
+  { id:'zones', title:'ZONES', desc:'Damage fields drop across the arena. Density capped at 4.',
+    category:'CONTENT', scoreMult:1.5,
+    apply(g){ g.modifierEnemyFilter = ['field']; g.modifierMaxDensity = 4; } },
+  { id:'phalanx', title:'PHALANX', desc:'Only shielded foes. Flank for double near-miss score.',
+    category:'CONTENT', scoreMult:1.5,
+    apply(g){ g.modifierEnemyFilter = ['shielded']; g.modifierMaxDensity = 7; } },
+];
+
+function rollModifierPicks(){
+  // pick three modifiers from three distinct categories so options always feel varied
+  const cats = ['CONTENT','SPATIAL','TEMPO','ECONOMY','CHALLENGE'];
+  // shuffle category order (Fisher-Yates)
+  for (let i=cats.length-1; i>0; i--){
+    const j = Math.floor(Math.random() * (i+1));
+    [cats[i], cats[j]] = [cats[j], cats[i]];
+  }
+  const picks = [];
+  for (const cat of cats){
+    const pool = MODIFIERS.filter(m => m.category === cat);
+    if (pool.length === 0) continue;
+    picks.push(pool[Math.floor(Math.random() * pool.length)]);
+    if (picks.length >= 3) break;
+  }
+  game.modifierPicks = picks;
+}
+
+function beginRun(){
+  // gated entry point used by all "start a run" buttons. Routes to picker if modifiers unlocked.
+  if ((meta.prestige || 0) >= 9){
+    rollModifierPicks();
+    game.activeModifier = null;  // cleared until pick or default
+    game.scene = 'modifierPick';
+  } else {
+    game.activeModifier = null;
+    startRun();
+  }
+}
+
+function selectModifier(m){
+  game.activeModifier = m;
+  startRun();
+}
+
+// ===== game state (per run) =====
+const game = {
+  scene:'menu',
+  paused:false,
+  t:0,
+  ascendAnim:0,
+  player:null,
+  arena:{ radius: BASE_ARENA_RADIUS },
+  enemies:[],
+  particles:[],
+  trail:[],
+  timeLeft:30,
+  runDuration:30,
+  spawnTimer:0,
+  runScore:0,
+  scoreAccum:0,
+  iframeBonus:0,
+  shake:0,
+  flash:0,
+  flashColor:'#ff6b8a',
+  result:{ survived:false, time:0, score:0, gained:0 },
+  resultTimer:0,
+  shopMsg:'',
+  shopMsgTimer:0,
+  resetState:0,         // 0 = idle, 1 = awaiting confirm
+  resetTimer:0,
+  buttonHits:[],
+  combo:{ time:0, mult:1, tier:0, tierFlash:0, breakFlash:0 },
+  nearMissCount:0,
+  orbs:[],
+  cyanOrbTimer:0,
+  whiteOrbTimer:0,
+  goldOrbSpawned:false,
+  runEssence:0,        // essence earned this run
+  cyanCount:0, whiteCount:0, goldCount:0,  // per-run pickup tally
+};
+
+// near-miss: enemy passes within NEAR_MISS_PX of touching the player
+const NEAR_MISS_PX = 16;
+
+// orb types — pickups that spawn in the arena during a run
+// designed to be visually opposite to enemies: hollow rings + symbol vs solid + glow
+const ORB = {
+  cyan: {
+    color:'#5ee9ff', radius:9, symbol:'◊',
+    fadeIn:0.4, lifetime:5.0, fadeOut:0.6,
+    pulseSpeed:3.5,
+  },
+  white: {
+    color:'#ffffff', radius:10, symbol:'+',
+    fadeIn:0.4, lifetime:6.0, fadeOut:0.7,
+    pulseSpeed:2.4,
+  },
+  gold: {
+    color:'#facc15', radius:11, symbol:'★',
+    fadeIn:0.5, lifetime:7.0, fadeOut:0.8,
+    pulseSpeed:5.0,
+  },
+};
+// combo tier thresholds — seconds without taking damage
+const COMBO_TIERS = [
+  { t:3,  mult:1.2 },
+  { t:7,  mult:1.5 },
+  { t:12, mult:2.0 },
+];
+
+function makePlayer(){
+  return {
+    x:CX, y:CY, vx:0, vy:0,
+    radius:13, baseRadius:13,
+    speed:230,
+    maxHp:3, hp:3, displayHp:1,
+    invuln:1.0,
+    damageFlash:0,
+    recentLostSegment:-1,
+    goldBoost:0,
+  };
+}
+
+// ===== input =====
+const keys = {};
+let mx=0, my=0;
+const STICK_MAX = 60;
+const touch = { active:false, id:null, bx:0, by:0, x:0, y:0 };
+const shopUI = { scroll:0, maxScroll:0, dragging:false, dragStartY:0, dragStartScroll:0, dragMoved:false, pointerId:null, candidate:null, tab:'stats', pickerOpen:false, pickerSlot:-1, pickerScroll:0, pickerMaxScroll:0, settingsOpen:false, ascendConfirm:false };
+
+function openShop(){ shopUI.scroll = 0; game.scene = 'shop'; }
+
+// Cycle through unlocked modes (30 → 60 → 90 → 30). Locked modes are skipped.
+// Selected mode persists in meta.preferredMode and is read by startRun().
+function cycleMode(){
+  const unlocked = [30];
+  if ((meta.prestige || 0) >= 6) unlocked.push(60);
+  if ((meta.prestige || 0) >= 12) unlocked.push(90);
+  const cur = meta.preferredMode || 30;
+  const idx = unlocked.indexOf(cur);
+  meta.preferredMode = unlocked[(idx + 1) % unlocked.length];
+  saveMeta();
+}
+
+function modeLabel(dur){
+  if (dur === 60) return '60s  ·  EXTENDED';
+  if (dur === 90) return '90s  ·  ENDURANCE';
+  return '30s  ·  CORE';
+}
+
+// ===== pause =====
+function pauseGame(){
+  if (game.scene !== 'playing') return;
+  if (game.paused) return;
+  game.paused = true;
+  // clear active touch so player doesn't fly when resuming
+  touch.active = false;
+}
+function resumeGame(){
+  if (!game.paused) return;
+  game.paused = false;
+  // also clear stale input on resume
+  touch.active = false;
+  // recalibrate gyro so phone position when resuming becomes the new center
+  if (meta.gyroEnabled && gyro.active) recalibrateGyro();
+}
+function togglePause(){
+  if (game.paused) resumeGame();
+  else pauseGame();
+}
+
+// auto-pause on visibility loss (call, text, app switch, screen lock)
+if (typeof document !== 'undefined' && document.addEventListener){
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) pauseGame();
+  });
+  // also pause on window blur for desktop (alt-tab)
+  addEventListener('blur', () => { pauseGame(); });
+}
+
+// ===== settings overlay =====
+function openSettings(){ shopUI.settingsOpen = true; }
+function closeSettings(){
+  shopUI.settingsOpen = false;
+  // cancel any pending reset confirmation when closing
+  game.resetState = 0;
+  game.resetTimer = 0;
+}
+
+// ===== gyro / device orientation =====
+const gyro = {
+  available: false,           // device supports DeviceOrientationEvent
+  permission: 'unknown',      // 'unknown' | 'granted' | 'denied' | 'prompt'
+  active: false,              // listener attached and feeding input
+  beta: 0, gamma: 0,           // latest readings
+  baselineBeta: null, baselineGamma: null,  // captured at run start
+  raw: { beta: 0, gamma: 0 }, // most recent raw values (pre-baseline)
+  eventCount: 0,              // total events received — diagnostic
+};
+const GYRO_SENSITIVITY = 0.045;  // degrees per second of input — higher = more responsive
+const GYRO_MAX_TILT = 22;        // tilt past which we treat as full input
+
+// quick capability detect
+if (typeof window !== 'undefined' && 'DeviceOrientationEvent' in window){
+  gyro.available = true;
+  // iOS 13+ requires permission; if not present, treat as auto-granted
+  if (typeof DeviceOrientationEvent.requestPermission !== 'function'){
+    gyro.permission = 'granted';
+  } else {
+    gyro.permission = 'prompt';
+  }
+}
+
+function gyroHandler(e){
+  if (e.beta == null || e.gamma == null) return;
+  gyro.eventCount++;
+  gyro.raw.beta = e.beta;
+  gyro.raw.gamma = e.gamma;
+  // beta: front-back tilt, -180 to 180 (90 = phone vertical face-up)
+  // gamma: left-right tilt, -90 to 90
+  if (gyro.baselineBeta === null){
+    gyro.baselineBeta = e.beta;
+    gyro.baselineGamma = e.gamma;
+  }
+  gyro.beta = e.beta - gyro.baselineBeta;
+  gyro.gamma = e.gamma - gyro.baselineGamma;
+}
+
+function startGyroListener(){
+  if (gyro.active) return;
+  gyro.eventCount = 0;
+  addEventListener('deviceorientation', gyroHandler);
+  gyro.active = true;
+}
+function stopGyroListener(){
+  if (!gyro.active) return;
+  removeEventListener('deviceorientation', gyroHandler);
+  gyro.active = false;
+  gyro.baselineBeta = null;
+  gyro.baselineGamma = null;
+}
+
+// resets baseline so next reading becomes "center" — call at start of every run
+function recalibrateGyro(){
+  gyro.baselineBeta = null;
+  gyro.baselineGamma = null;
+}
+
+// flow for the settings toggle: ask permission if needed, then enable
+async function enableGyro(){
+  if (!gyro.available){
+    game.shopMsg = 'This device has no gyroscope.';
+    game.shopMsgTimer = 2.5;
+    return;
+  }
+  if (gyro.permission === 'prompt'){
+    try {
+      const result = await DeviceOrientationEvent.requestPermission();
+      gyro.permission = result;
+      if (result !== 'granted'){
+        game.shopMsg = 'Gyro access denied.';
+        game.shopMsgTimer = 2.5;
+        return;
+      }
+    } catch (err){
+      game.shopMsg = 'Could not request gyro access.';
+      game.shopMsgTimer = 2.5;
+      return;
+    }
+  }
+  if (gyro.permission !== 'granted') return;
+  meta.gyroEnabled = true;
+  saveMeta();
+  startGyroListener();
+}
+
+function disableGyro(){
+  meta.gyroEnabled = false;
+  saveMeta();
+  stopGyroListener();
+}
+
+addEventListener('keydown', e=>{
+  const k = e.key.toLowerCase();
+  if (keys[k]) return;
+  keys[k] = true;
+  // settings overlay can be open in any non-playing scene; handle escape first
+  if (shopUI.settingsOpen && (game.scene === 'menu' || game.scene === 'shop')){
+    if (k==='escape') closeSettings();
+    return;
+  }
+  if (game.scene==='menu'){
+    if (shopUI.pickerOpen){
+      if (k==='escape') closeSlotPicker();
+      return;
+    }
+    if (k===' '||k==='enter'){ e.preventDefault(); beginRun(); }
+    else if (k==='u'||k==='b'){ openShop(); }
+  } else if (game.scene==='result'){
+    if (k===' '||k==='enter'){ e.preventDefault(); beginRun(); }
+    else if (k==='u'||k==='b'){ openShop(); }
+    else if (k==='m'||k==='escape'){ game.scene = 'menu'; }
+  } else if (game.scene==='modifierPick'){
+    if (k==='escape'||k==='b'){ game.scene = 'menu'; game.modifierPicks = null; }
+    else if (k===' '||k==='enter'){ e.preventDefault(); selectModifier(null); }
+    else if (k==='1'||k==='2'||k==='3'){
+      const idx = parseInt(k, 10) - 1;
+      if (game.modifierPicks && game.modifierPicks[idx]) selectModifier(game.modifierPicks[idx]);
+    }
+  } else if (game.scene==='shop'){
+    // ascend modal absorbs Esc so it doesn't fall through to leaving the shop
+    if (shopUI.ascendConfirm){
+      if (k==='escape') shopUI.ascendConfirm = false;
+      return;
+    }
+    if (k==='escape'||k==='b'){ game.scene = 'menu'; }
+  } else if (game.scene==='playing'){
+    if (k==='p' || k==='escape'){ togglePause(); }
+  }
+});
+addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+
+function hitButton(x, y){
+  for (const b of game.buttonHits){
+    if (x>=b.x && x<=b.x+b.w && y>=b.y && y<=b.y+b.h) return b;
+  }
+  return null;
+}
+
+addEventListener('pointermove', e=>{
+  mx = e.clientX; my = e.clientY;
+  if (touch.active && e.pointerId === touch.id){
+    touch.x = e.clientX;
+    touch.y = e.clientY;
+  }
+  if (game.scene === 'shop' && shopUI.dragging && e.pointerId === shopUI.pointerId){
+    const dy = e.clientY - shopUI.dragStartY;
+    if (Math.abs(dy) > 6) shopUI.dragMoved = true;
+    shopUI.scroll = clamp(shopUI.dragStartScroll - dy, 0, shopUI.maxScroll);
+  }
+  if (shopUI.pickerOpen && shopUI.dragging && e.pointerId === shopUI.pointerId){
+    const dy = e.clientY - shopUI.dragStartY;
+    if (Math.abs(dy) > 6) shopUI.dragMoved = true;
+    shopUI.pickerScroll = clamp(shopUI.dragStartScroll - dy, 0, shopUI.pickerMaxScroll);
+  }
+});
+addEventListener('pointerdown', e=>{
+  mx = e.clientX; my = e.clientY;
+  if (game.scene === 'playing'){
+    // mouse falls through so PC drag works as a virtual joystick (analog testing path)
+    e.preventDefault();
+    // when paused, the screen is the resume hit area — let the standard hit detection handle it
+    if (game.paused){
+      const b = hitButton(e.clientX, e.clientY);
+      if (b) b.action();
+      return;
+    }
+    // skip touch joystick entirely when gyro is the active input
+    if (meta.gyroEnabled && gyro.active){
+      // still allow pause button taps
+      const b = hitButton(e.clientX, e.clientY);
+      if (b) b.action();
+      return;
+    }
+    // tap on the pause button takes priority over starting a joystick drag
+    const b = hitButton(e.clientX, e.clientY);
+    if (b){ b.action(); return; }
+    if (!touch.active){
+      touch.active = true;
+      touch.id = e.pointerId;
+      touch.bx = e.clientX;
+      touch.by = e.clientY;
+      touch.x = e.clientX;
+      touch.y = e.clientY;
+      // capture the pointer so pointermove keeps firing if the cursor leaves the
+      // viewport during a drag. without this the joystick visually freezes at its
+      // last in-window position and pops back when the cursor returns.
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+    }
+    // additional touches ignored — passives handle all "abilities" automatically
+  } else if (shopUI.pickerOpen){
+    // picker drag-or-tap (works regardless of scene)
+    shopUI.dragging = true;
+    shopUI.dragStartY = e.clientY;
+    shopUI.dragStartScroll = shopUI.pickerScroll;
+    shopUI.dragMoved = false;
+    shopUI.pointerId = e.pointerId;
+    shopUI.candidate = hitButton(e.clientX, e.clientY);
+  } else if (game.scene === 'shop'){
+    // capture for drag-or-tap; only fire on release if no drag
+    shopUI.dragging = true;
+    shopUI.dragStartY = e.clientY;
+    shopUI.dragStartScroll = shopUI.scroll;
+    shopUI.dragMoved = false;
+    shopUI.pointerId = e.pointerId;
+    shopUI.candidate = hitButton(e.clientX, e.clientY);
+  } else {
+    const b = hitButton(e.clientX, e.clientY);
+    if (b) b.action();
+  }
+});
+function releaseTouch(e){
+  if (touch.active && e.pointerId === touch.id){
+    touch.active = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  }
+  if (shopUI.dragging && e.pointerId === shopUI.pointerId){
+    if (!shopUI.dragMoved && shopUI.candidate) shopUI.candidate.action();
+    shopUI.dragging = false;
+    shopUI.candidate = null;
+  }
+}
+addEventListener('pointerup', releaseTouch);
+addEventListener('pointercancel', releaseTouch);
+addEventListener('contextmenu', e=>e.preventDefault());
+addEventListener('wheel', e=>{
+  if (shopUI.pickerOpen && shopUI.pickerMaxScroll > 0){
+    e.preventDefault();
+    shopUI.pickerScroll = clamp(shopUI.pickerScroll + e.deltaY, 0, shopUI.pickerMaxScroll);
+  } else if (game.scene === 'shop' && shopUI.maxScroll > 0){
+    e.preventDefault();
+    shopUI.scroll = clamp(shopUI.scroll + e.deltaY, 0, shopUI.maxScroll);
+  }
+}, { passive:false });
+
+// ===== enemy types =====
+const ENEMY = {
+  drifter:{
+    radius:13, speed:118, color:'#ff6b8a', minTime:30, weight:10,
+    behavior(e, dt, p){ e.x+=e.vx*dt; e.y+=e.vy*dt; }
+  },
+  tracker:{
+    radius:11, speed:108, color:'#ff9a3f', minTime:24, weight:5,
+    behavior(e, dt, p){
+      if (e.age < 1.5){
+        const ang = Math.atan2(p.y-e.y, p.x-e.x);
+        const cur = Math.atan2(e.vy, e.vx);
+        let diff = ((ang - cur + Math.PI*3) % TAU) - Math.PI;
+        const turn = clamp(diff, -1.0*dt, 1.0*dt);
+        const na = cur + turn;
+        const sp = Math.hypot(e.vx, e.vy);
+        e.vx = Math.cos(na)*sp; e.vy = Math.sin(na)*sp;
+      }
+      e.x+=e.vx*dt; e.y+=e.vy*dt;
+    }
+  },
+  bouncer:{
+    radius:12, speed:138, color:'#ec4899', minTime:18, weight:4,
+    behavior(e, dt, p){
+      e.x+=e.vx*dt; e.y+=e.vy*dt;
+      const dx = e.x-CX, dy = e.y-CY;
+      const d = Math.hypot(dx,dy);
+      const R = game.arena.radius - 2;
+      if (d > R && e.bouncesLeft > 0){
+        const nx = dx/d, ny = dy/d;
+        const dot = e.vx*nx + e.vy*ny;
+        if (dot > 0){
+          e.vx -= 2*dot*nx; e.vy -= 2*dot*ny;
+          e.bouncesLeft--;
+          burst(e.x, e.y, e.color, 8, 2);
+        }
+      }
+    }
+  },
+  brute:{
+    radius:26, speed:74, color:'#c084fc', minTime:12, weight:2,
+    behavior(e, dt, p){ e.x+=e.vx*dt; e.y+=e.vy*dt; }
+  },
+  splitter:{
+    radius:15, speed:110, color:'#dc2626', minTime:8, weight:3,
+    behavior(e, dt, p){
+      e.x+=e.vx*dt; e.y+=e.vy*dt;
+      if (!e.hasSplit && e.age > 0.9){
+        e.hasSplit = true;
+        const ang = Math.atan2(e.vy, e.vx);
+        const sp = Math.hypot(e.vx, e.vy) * 1.15;
+        // density-clamped: +1 because the splitter itself is dying this frame, freeing its slot.
+        // at cap → 1 child takes splitter's slot; under cap → normal 2 children.
+        const splitCap = game.modifierMaxDensity || MAX_DENSITY;
+        const room = splitCap - game.enemies.length + 1;
+        const numChildren = Math.max(0, Math.min(2, room));
+        const offsets = numChildren === 2 ? [-0.55, 0.55] : (numChildren === 1 ? [0] : []);
+        for (const off of offsets){
+          const a = ang + off;
+          game.enemies.push({
+            type:'splitter_child', x:e.x, y:e.y,
+            vx:Math.cos(a)*sp, vy:Math.sin(a)*sp,
+            radius:9, color:'#fb7185',
+            behavior:ENEMY.drifter.behavior,
+            bouncesLeft:0, age:0, active:true, warning:0, warningMax:0, born:true,
+          });
+        }
+        burst(e.x, e.y, e.color, 16, 2.5);
+        e.dead = true;
+      }
+    }
+  },
+  sniper:{
+    radius:9, speed:520, color:'#ef4444', minTime:4, weight:3,
+    warningOverride: 1.4,
+    behavior(e, dt, p){ e.x+=e.vx*dt; e.y+=e.vy*dt; }
+  },
+  // FIELD — stationary damage zone. Telegraphs for 1.5s, then deals damage for 4-5.5s, then fades.
+  // Spawned inside the arena (custom path in spawnEnemy below). Used by ZONES modifier and longer modes.
+  field:{
+    radius:30, speed:0, color:'#fb923c', minTime:30, weight:4,
+    warningOverride: 1.5,
+    behavior(e, dt, p){
+      e.zonePhase = e.zonePhase || 'active';
+      e.phaseTime = (e.phaseTime || 0) + dt;
+      if (!e.zoneDuration) e.zoneDuration = rand(4.0, 5.5);
+      if (e.zonePhase === 'active' && e.phaseTime >= e.zoneDuration){
+        e.zonePhase = 'fading';
+        e.phaseTime = 0;
+        e.zoneVisualRadius = e.radius;  // remember for rendering
+        e.radius = 0;                    // disable collision while fading
+      } else if (e.zonePhase === 'fading' && e.phaseTime >= 0.5){
+        e.dead = true;
+      }
+    }
+  },
+  // SHIELDED — drifts toward player, has a front-facing shield. Front near-miss blocked,
+  // back near-miss earns 2x score. Used by AEGIS modifier and longer modes.
+  shielded:{
+    radius:12, speed:95, color:'#facc15', minTime:30, weight:4,
+    behavior(e, dt, p){
+      e.x += e.vx*dt; e.y += e.vy*dt;
+      // gentle homing — turn toward player at limited rate so flanking remains possible
+      const targetAng = Math.atan2(p.y - e.y, p.x - e.x);
+      const curAng = Math.atan2(e.vy, e.vx);
+      const speed = Math.hypot(e.vx, e.vy);
+      let diff = targetAng - curAng;
+      while (diff > Math.PI) diff -= TAU;
+      while (diff < -Math.PI) diff += TAU;
+      const turnRate = 0.6;  // rad/sec — slow enough that flanking works
+      const newAng = curAng + clamp(diff, -turnRate*dt, turnRate*dt);
+      e.vx = Math.cos(newAng) * speed;
+      e.vy = Math.sin(newAng) * speed;
+    }
+  },
+};
+
+function unlockedTypes(){
+  // modifier filter overrides everything (including wave) — BIG PIECES forces brutes
+  // from second 0, even though brute.minTime would normally lock it until late game.
+  if (game.modifierEnemyFilter && game.modifierEnemyFilter.length > 0){
+    return game.modifierEnemyFilter.filter(k => ENEMY[k]);
+  }
+  // wave-aware progression: each wave is a fresh 30s difficulty ramp. Field/shielded
+  // join the pool only at wave 2/3 of longer modes (and never via this path in 30s mode).
+  const wTLeft = game.waveTimeLeft || game.timeLeft;
+  const wave = game.wave || 1;
+  const list = Object.keys(ENEMY).filter(k => {
+    if (k === 'field' || k === 'shielded') return false;  // wave bonuses, added below
+    return ENEMY[k].minTime >= wTLeft || k === 'drifter';
+  });
+  if (wave >= 2) list.push('field');
+  if (wave >= 3) list.push('shielded');
+  return list;
+}
+function pickEnemyType(){
+  const list = unlockedTypes();
+  let total = 0;
+  for (const k of list) total += ENEMY[k].weight;
+  let r = Math.random()*total;
+  for (const k of list){ r -= ENEMY[k].weight; if (r<=0) return k; }
+  return 'drifter';
+}
+
+function spawnEnemy(forceType){
+  const type = forceType || pickEnemyType();
+  const def = ENEMY[type];
+
+  // FIELD enemies spawn INSIDE the arena (they're stationary damage zones).
+  // Skip the edge-spawn-then-aim-inward trajectory used by all other enemies.
+  if (type === 'field'){
+    const fAng = Math.random() * TAU;
+    const fDist = rand(0.30, 0.65) * game.arena.radius;
+    game.enemies.push({
+      type, x: CX + Math.cos(fAng)*fDist, y: CY + Math.sin(fAng)*fDist,
+      vx: 0, vy: 0,
+      radius: def.radius, color: def.color,
+      behavior: def.behavior,
+      bouncesLeft: 0, age: 0, active: false,
+      warning: def.warningOverride, warningMax: def.warningOverride,
+      born: false,
+    });
+    return;
+  }
+
+  const ang = Math.random()*TAU;
+  const spawnDist = game.arena.radius + 70;
+  const sx = CX + Math.cos(ang)*spawnDist;
+  const sy = CY + Math.sin(ang)*spawnDist;
+  let targetAng, targetDist;
+  if (type === 'sniper'){
+    targetAng = ang + Math.PI + rand(-0.2, 0.2);
+    targetDist = rand(0, game.arena.radius * 0.4);
+  } else {
+    targetAng = ang + Math.PI + rand(-0.55, 0.55);
+    targetDist = rand(0, game.arena.radius * 0.55);
+  }
+  const tx = CX + Math.cos(targetAng)*targetDist;
+  const ty = CY + Math.sin(targetAng)*targetDist;
+  const ddx = tx-sx, ddy = ty-sy, dd = Math.hypot(ddx,ddy);
+  const tProg = 1 - game.timeLeft/game.runDuration;
+  const speed = def.speed * (1 + tProg*0.15) * (game.modifierEnemySpeedMult || 1);
+  const e = {
+    type, x:sx, y:sy,
+    vx: ddx/dd*speed, vy: ddy/dd*speed,
+    radius: def.radius, color: def.color,
+    behavior: def.behavior,
+    bouncesLeft: type==='bouncer' ? 3 : 0,
+    age:0, active:false,
+    warning: def.warningOverride || 0.55,
+    warningMax: def.warningOverride || 0.55,
+    born:false,
+  };
+  game.enemies.push(e);
+  return e;
+}
+
+// ===== particles =====
+function burst(x, y, color, n=12, sp=3){
+  for (let i=0;i<n;i++){
+    const a = Math.random()*TAU;
+    const v = rand(sp*30, sp*120);
+    game.particles.push({ x, y, vx:Math.cos(a)*v, vy:Math.sin(a)*v, life:rand(.3,.7), age:0, r:rand(1,3), color });
+  }
+}
+function ringBurst(x, y, color, n=24){
+  for (let i=0;i<n;i++){
+    const a = (i/n)*TAU;
+    const v = rand(180, 280);
+    game.particles.push({ x, y, vx:Math.cos(a)*v, vy:Math.sin(a)*v, life:.55, age:0, r:rand(1,2.5), color });
+  }
+}
+
+function awardNearMiss(e, mult){
+  // base 5 score, scaled by combo + meta multiplier. mult > 1 for special cases (e.g. shielded back-pass).
+  mult = mult || 1;
+  const bonus = 5 * mult * game.combo.mult * game.scoreMult;
+  game.scoreFloat += bonus;
+  game.nearMissCount++;
+  // visible feedback for the bonus case so player learns the back-pass mechanic
+  if (mult > 1) ringBurst(e.x, e.y, '#facc15', 14);
+
+  // Edge passive — count toward threshold
+  const edgeLvl = activePassiveLevel('edge');
+  if (edgeLvl > 0){
+    game.passive.edge.count++;
+    if (game.passive.edge.count >= EDGE_THRESHOLD[edgeLvl-1]){
+      game.passive.edge.count = 0;
+      game.passive.edge.slowTimer = EDGE_DURATION[edgeLvl-1];
+      // visual: arena-wide flash + ring at player
+      game.flash = 0.25;
+      game.flashColor = '#5ee9ff';
+      ringBurst(game.player.x, game.player.y, '#5ee9ff', 22);
+    }
+  }
+
+  // particle flourish at the enemy
+  for (let i=0;i<5;i++){
+    const a = Math.random()*TAU;
+    const v = rand(40, 100);
+    game.particles.push({
+      x:e.x, y:e.y,
+      vx:Math.cos(a)*v, vy:Math.sin(a)*v,
+      life:rand(.25,.45), age:0,
+      r:rand(.8,1.4), color:'#5ee9ff'
+    });
+  }
+  // a couple of bright sparkles drifting from enemy toward player
+  const p = game.player;
+  for (let i=0;i<2;i++){
+    const t = (i+1)/3;
+    game.particles.push({
+      x: lerp(e.x, p.x, t),
+      y: lerp(e.y, p.y, t),
+      vx: rand(-12,12), vy: rand(-30,-15),
+      life:.45, age:0,
+      r:1.1, color:'#ffffff'
+    });
+  }
+}
+
+// ===== orbs =====
+function spawnOrb(type){
+  const def = ORB[type];
+  // bias toward periphery (50-85% of arena radius), but not on top of player
+  const p = game.player;
+  let bestX, bestY, bestScore = -1;
+  for (let attempt = 0; attempt < 6; attempt++){
+    const ang = Math.random() * TAU;
+    const distFrac = rand(0.50, 0.85);
+    const r = (game.arena.radius - def.radius - 4) * distFrac;
+    const x = CX + Math.cos(ang) * r;
+    const y = CY + Math.sin(ang) * r;
+    // score by distance from player (we want some, not too much)
+    const dp = p ? dist(x, y, p.x, p.y) : 999;
+    const score = dp < 30 ? -1 : dp;       // never within 30px of player
+    if (score > bestScore){ bestScore = score; bestX = x; bestY = y; }
+  }
+  if (bestScore < 0){
+    // fallback — couldn't find clean spot, just use opposite side from player
+    const ang = p ? Math.atan2(p.y - CY, p.x - CX) + Math.PI : Math.random() * TAU;
+    const r = (game.arena.radius - def.radius - 4) * 0.65;
+    bestX = CX + Math.cos(ang) * r;
+    bestY = CY + Math.sin(ang) * r;
+  }
+  game.orbs.push({
+    type, x: bestX, y: bestY,
+    radius: def.radius,
+    age: 0,
+    state: 'fadeIn',
+    stateTime: 0,
+  });
+}
+
+function updateOrbs(dt){
+  // FAMINE modifier: orbs only spawn in last 10s. Block all spawn paths until then.
+  const orbWindow = !game.modifierOrbBlock || game.timeLeft <= 10;
+  // spawn timers
+  game.cyanOrbTimer -= dt;
+  game.whiteOrbTimer -= dt;
+  if (orbWindow && game.cyanOrbTimer <= 0){
+    spawnOrb('cyan');
+    game.cyanOrbTimer = rand(4.5, 6.5);
+  }
+  if (orbWindow && game.whiteOrbTimer <= 0){
+    spawnOrb('white');
+    game.whiteOrbTimer = rand(13, 18);
+  }
+  // gold: 25% chance once per run, somewhere between 12s elapsed and 8s remaining
+  if (orbWindow && !game.goldOrbSpawned && (game.runDuration - game.timeLeft) > 12 && game.timeLeft > 8){
+    if (Math.random() < 0.012){  // ~25% over the eligible window
+      spawnOrb('gold');
+      game.goldOrbSpawned = true;
+    }
+  }
+
+  const p = game.player;
+  for (let i = game.orbs.length - 1; i >= 0; i--){
+    const o = game.orbs[i];
+    const def = ORB[o.type];
+    o.age += dt;
+    o.stateTime += dt;
+
+    if (o.state === 'fadeIn' && o.stateTime >= def.fadeIn){
+      o.state = 'live';
+      o.stateTime = 0;
+    } else if (o.state === 'live' && o.stateTime >= def.lifetime){
+      o.state = 'fadeOut';
+      o.stateTime = 0;
+    } else if (o.state === 'fadeOut' && o.stateTime >= def.fadeOut){
+      game.orbs.splice(i, 1);
+      continue;
+    }
+
+    // pickup: generous radius, only while not fading out
+    if (o.state !== 'fadeOut' && p.hp > 0){
+      const cd = dist(o.x, o.y, p.x, p.y);
+      if (cd < o.radius + p.radius + 4){
+        collectOrb(o);
+        game.orbs.splice(i, 1);
+      }
+    }
+  }
+}
+
+function collectOrb(o){
+  const p = game.player;
+  if (o.type === 'cyan'){
+    game.runEssence += 1;
+    game.cyanCount++;
+    orbPickupBurst(o.x, o.y, '#5ee9ff', 12);
+  } else if (o.type === 'white'){
+    if (p.hp < p.maxHp){
+      p.hp += 1;
+      p.displayHp = p.hp / p.maxHp;
+      game.whiteCount++;
+      orbPickupBurst(o.x, o.y, '#ffffff', 18);
+      ringBurst(p.x, p.y, '#ffffff', 14);
+    } else {
+      // already full → essence
+      game.runEssence += 3;
+      game.whiteCount++;
+      orbPickupBurst(o.x, o.y, '#5ee9ff', 16);
+    }
+  } else if (o.type === 'gold'){
+    game.runEssence += 5;
+    game.goldCount++;
+    p.invuln = Math.max(p.invuln, 3.0);
+    p.goldBoost = 3.0;        // 3 second window where score is x3
+    orbPickupBurst(o.x, o.y, '#facc15', 24);
+    ringBurst(p.x, p.y, '#facc15', 22);
+  }
+
+  // ECHO passive — spawn afterimage at pickup location (player's current position is the orb's location)
+  const echoLvl = activePassiveLevel('echo');
+  if (echoLvl > 0){
+    game.passive.echo.afterimages.push({
+      x: p.x, y: p.y,
+      age: 0,
+      life: ECHO_LIFETIME[echoLvl-1],
+    });
+  }
+}
+
+function orbPickupBurst(x, y, color, n){
+  for (let i=0;i<n;i++){
+    const a = (i/n)*TAU + rand(-0.2,0.2);
+    const v = rand(60, 160);
+    game.particles.push({
+      x, y,
+      vx:Math.cos(a)*v, vy:Math.sin(a)*v,
+      life:rand(.4,.7), age:0,
+      r:rand(1,2), color
+    });
+  }
+  // a couple of star-like sparks
+  for (let i=0;i<4;i++){
+    game.particles.push({
+      x, y,
+      vx:rand(-30,30), vy:rand(-100,-40),
+      life:.6, age:0, r:1.4, color:'#ffffff'
+    });
+  }
+}
+
+// ===== passive triggers =====
+const SLIPSTREAM_INTERVAL = [8, 7, 6];
+const SLIPSTREAM_DURATION = [2.0, 2.5, 3.0];
+const SLIPSTREAM_SHRINK = [0.30, 0.30, 0.30];
+
+const RESONANCE_BOOST = [0.10, 0.14, 0.18];
+
+const MAGNET_RANGE = [60, 90, 130];
+const MAGNET_PULL_SPEED = 90;        // px/s pull when in range
+
+const EDGE_THRESHOLD = [5, 4, 3];
+const EDGE_DURATION = [0.6, 0.7, 0.9];
+const EDGE_SLOW_FACTOR = 0.30;       // enemies move at 30% speed during slow
+const MAX_DENSITY = 12;              // hard cap on active+warning enemies; backstop against late-game chaos
+
+const PULSE_INTERVAL = [12, 10, 8];
+const PULSE_RANGE = [120, 140, 160];
+const PULSE_PUSH_SPEED = 350;        // px/s outward
+const PULSE_PUSH_DURATION = 0.4;     // how long enemies retain push velocity
+
+// Crystal — combo tier required to charge (tier 3 = ×2.0, tier 2 = ×1.5)
+const CRYSTAL_REQ_TIER = [3, 2, 2];
+
+const ECHO_LIFETIME = [1.5, 2.0, 2.5];
+
+const GREED_THRESHOLD = [100, 75, 50];
+const GREED_SPARKLE_LIFE = 6.0;
+
+function updatePassives(dt){
+  const ps = game.passive;
+  const p = game.player;
+
+  // SLIPSTREAM — timer-based hitbox shrink
+  const slipLvl = activePassiveLevel('slipstream');
+  if (slipLvl > 0){
+    if (ps.slipstream.active > 0){
+      ps.slipstream.active = Math.max(0, ps.slipstream.active - dt);
+      if (ps.slipstream.active === 0){
+        p.radius = p.baseRadius;
+      }
+    } else {
+      ps.slipstream.timer += dt;
+      if (ps.slipstream.timer >= SLIPSTREAM_INTERVAL[slipLvl-1]){
+        ps.slipstream.timer = 0;
+        ps.slipstream.active = SLIPSTREAM_DURATION[slipLvl-1];
+        p.radius = p.baseRadius * (1 - SLIPSTREAM_SHRINK[slipLvl-1]);
+        ringBurst(p.x, p.y, '#5ee9ff', 10);
+      }
+    }
+  } else if (p.radius !== p.baseRadius){
+    p.radius = p.baseRadius;
+  }
+
+  // MAGNET — pulls orbs in range toward player
+  const magLvl = activePassiveLevel('magnet');
+  if (magLvl > 0){
+    const range = MAGNET_RANGE[magLvl-1];
+    for (const o of game.orbs){
+      if (o.state === 'fadeOut') continue;
+      const ddx = p.x - o.x, ddy = p.y - o.y;
+      const dd = Math.hypot(ddx, ddy);
+      if (dd > 0 && dd < range){
+        const pullFrac = 1 - dd/range;
+        const pull = MAGNET_PULL_SPEED * pullFrac * dt;
+        o.x += (ddx/dd) * pull;
+        o.y += (ddy/dd) * pull;
+      }
+    }
+    // also pull greed sparkles in
+    if (game.greedSparkles){
+      for (const s of game.greedSparkles){
+        const ddx = p.x - s.x, ddy = p.y - s.y;
+        const dd = Math.hypot(ddx, ddy);
+        if (dd > 0 && dd < range){
+          const pullFrac = 1 - dd/range;
+          const pull = MAGNET_PULL_SPEED * pullFrac * dt;
+          s.x += (ddx/dd) * pull;
+          s.y += (ddy/dd) * pull;
+        }
+      }
+    }
+  }
+
+  // EDGE — slow timer ticks down
+  if (ps.edge.slowTimer > 0){
+    ps.edge.slowTimer = Math.max(0, ps.edge.slowTimer - dt);
+  }
+
+  // PULSE — timer-based outward shockwave
+  const pulseLvl = activePassiveLevel('pulse');
+  if (pulseLvl > 0){
+    ps.pulse.timer += dt;
+    if (ps.pulse.timer >= PULSE_INTERVAL[pulseLvl-1]){
+      ps.pulse.timer = 0;
+      const range = PULSE_RANGE[pulseLvl-1];
+      // push enemies within range outward from player
+      for (const e of game.enemies){
+        if (!e.active) continue;
+        const ddx = e.x - p.x, ddy = e.y - p.y;
+        const dd = Math.hypot(ddx, ddy);
+        if (dd > 0 && dd < range){
+          const nx = ddx/dd, ny = ddy/dd;
+          // strongest push when closer
+          const strength = 1 - dd/range;
+          e.vx = nx * PULSE_PUSH_SPEED * (0.5 + strength * 0.5);
+          e.vy = ny * PULSE_PUSH_SPEED * (0.5 + strength * 0.5);
+        }
+      }
+      // visual shockwave: a quick ring expansion
+      game.pulseEffects = game.pulseEffects || [];
+      game.pulseEffects.push({ x: p.x, y: p.y, r: 0, maxR: range, age: 0 });
+      ringBurst(p.x, p.y, '#5ee9ff', 16);
+    }
+  }
+  // pulse visual effects decay
+  if (game.pulseEffects){
+    for (let i = game.pulseEffects.length - 1; i >= 0; i--){
+      const fx = game.pulseEffects[i];
+      fx.age += dt;
+      fx.r = fx.maxR * Math.min(1, fx.age / 0.4);
+      if (fx.age > 0.5) game.pulseEffects.splice(i, 1);
+    }
+  }
+
+  // CRYSTAL — charges when at required combo tier; held until used
+  const crystalLvl = activePassiveLevel('crystal');
+  if (crystalLvl > 0){
+    const reqTier = CRYSTAL_REQ_TIER[crystalLvl-1];
+    const cap = crystalLvl >= 3 ? 2 : 1;
+    ps.crystal.maxCharges = cap;
+    if (ps.crystal.charges < cap && game.combo.tier >= reqTier){
+      ps.crystal.charges = cap;
+      // soft cyan ring pulse to confirm charge
+      ringBurst(p.x, p.y, '#5ee9ff', 8);
+    }
+  } else {
+    ps.crystal.charges = 0;
+    ps.crystal.maxCharges = 0;
+  }
+
+  // ECHO — afterimages decay; absorb enemy collisions
+  if (ps.echo.afterimages.length > 0){
+    for (let i = ps.echo.afterimages.length - 1; i >= 0; i--){
+      const a = ps.echo.afterimages[i];
+      a.age += dt;
+      if (a.age >= a.life){
+        ps.echo.afterimages.splice(i, 1);
+        continue;
+      }
+      // check collisions with active enemies
+      for (let j = game.enemies.length - 1; j >= 0; j--){
+        const e = game.enemies[j];
+        if (!e.active) continue;
+        const cd = dist(e.x, e.y, a.x, a.y);
+        if (cd < e.radius + 11){
+          // enemy hits the afterimage — destroy enemy, consume afterimage
+          burst(e.x, e.y, e.color, 14, 2.5);
+          burst(a.x, a.y, '#5ee9ff', 12, 2);
+          game.enemies.splice(j, 1);
+          ps.echo.afterimages.splice(i, 1);
+          break;
+        }
+      }
+    }
+  }
+
+  // GREED — drop sparkle every threshold of score earned
+  const greedLvl = activePassiveLevel('greed');
+  if (greedLvl > 0){
+    const thresh = GREED_THRESHOLD[greedLvl-1];
+    while (game.runScore >= ps.greed.lastDropAt + thresh){
+      ps.greed.lastDropAt += thresh;
+      game.greedSparkles.push({
+        x: p.x + rand(-8, 8),
+        y: p.y + rand(-8, 8),
+        age: 0,
+        life: GREED_SPARKLE_LIFE,
+      });
+    }
+  }
+  // greed sparkles decay + pickup
+  if (game.greedSparkles){
+    for (let i = game.greedSparkles.length - 1; i >= 0; i--){
+      const s = game.greedSparkles[i];
+      s.age += dt;
+      if (s.age >= s.life){
+        game.greedSparkles.splice(i, 1);
+        continue;
+      }
+      const cd = dist(s.x, s.y, p.x, p.y);
+      if (cd < p.radius + 8){
+        game.runEssence += 1;
+        // small white burst
+        for (let k=0;k<6;k++){
+          const a = Math.random()*TAU;
+          const v = rand(40, 90);
+          game.particles.push({
+            x:s.x, y:s.y,
+            vx:Math.cos(a)*v, vy:Math.sin(a)*v,
+            life:.4, age:0, r:rand(.6,1.2), color:'#5ee9ff'
+          });
+        }
+        game.greedSparkles.splice(i, 1);
+      }
+    }
+  }
+}
+
+// returns true if an enemy should run at slowed speed this frame
+function enemySlowed(){
+  return game.passive.edge.slowTimer > 0;
+}
+
+// dt multiplier from combo tier — high combos make the world feel slower so
+// skill is legible without looking at the corner-of-screen multiplier.
+// Stacks multiplicatively with Edge slow at the call site.
+function comboSlowFactor(){
+  const t = game.combo.tier;
+  if (t >= 3) return 0.70;  // ×2.0 combo — 30% slower, clearly "in the zone"
+  if (t >= 2) return 0.85;  // ×1.5 combo — 15% slower, first noticeable threshold
+  return 1;
+}
+
+// Resonance modifies effective movement speed in real-time, called from update
+function resonanceMultiplier(){
+  const lvl = activePassiveLevel('resonance');
+  if (lvl > 0 && game.combo.tier >= 2){  // tier 2 = ×1.5
+    return 1 + RESONANCE_BOOST[lvl-1];
+  }
+  return 1;
+}
+
+// ===== run lifecycle =====
+function startRun(){
+  game.scene = 'playing';
+  game.paused = false;
+  game.player = makePlayer();
+  game.arena = { radius: BASE_ARENA_RADIUS };
+  game.enemies = [];
+  game.particles = [];
+  game.trail = [];
+  // reset all modifier-driven flags so a previous run's modifier doesn't bleed into this one
+  game.modifierEnemyFilter = null;
+  game.modifierSpawnMult = 1;
+  game.modifierEnemySpeedMult = 1;
+  game.modifierMaxDensity = 0;       // 0 = use default MAX_DENSITY
+  game.modifierOrbBlock = false;
+  game.modifierGlass = false;
+  game.modifierNoPassives = false;
+  recalibrateGyro();
+  // resolve mode from meta, gated by prestige unlock thresholds (defensive — UI shouldn't allow
+  // an unsupported choice but stale localStorage state could have a locked value).
+  let dur = meta.preferredMode || 30;
+  if (dur === 60 && (meta.prestige || 0) < 6) dur = 30;
+  if (dur === 90 && (meta.prestige || 0) < 12) dur = 30;
+  if (dur !== 30 && dur !== 60 && dur !== 90) dur = 30;
+  game.timeLeft = dur;
+  game.runDuration = dur;
+  // wave system: each 30-second segment is its own difficulty arc (fresh enemy ramp).
+  // wave 2 (60s mode) adds field; wave 3 (90s mode) adds shielded.
+  game.wave = 1;
+  game.lastWave = 1;
+  game.waveTimeLeft = 30;
+  game.waveTransitionTimer = 0;
+  game.waveLabelTimer = 0;
+  game.spawnTimer = 0.45;
+  game.runScore = 0;
+  game.scoreAccum = 0;
+  game.scoreFloat = 0;
+  game.scoreMult = 1;
+  game.iframeBonus = 0;
+  game.spawnRateMult = 1;
+  game.mendingLevel = 0;
+  game.healed20 = false;
+  game.healed10 = false;
+  game.shake = 0;
+  game.flash = 0;
+  game.combo.time = 0;
+  game.combo.mult = 1;
+  game.combo.tier = 0;
+  game.combo.tierFlash = 0;
+  game.combo.breakFlash = 0;
+  game.nearMissCount = 0;
+  game.orbs = [];
+  game.cyanOrbTimer = 3.0;     // first cyan ~3s in
+  game.whiteOrbTimer = 10.0;   // first white ~10s
+  game.goldOrbSpawned = false;
+  game.runEssence = 0;
+  game.cyanCount = 0;
+  game.whiteCount = 0;
+  game.goldCount = 0;
+  // passive run state — fresh on every run
+  game.passive = {
+    slipstream: { timer: 0, active: 0 },
+    magnet:     { },
+    phoenix:    { used: false },
+    resonance:  { },
+    edge:       { count: 0, slowTimer: 0 },
+    pulse:      { timer: 0 },                   // ticks toward next trigger
+    crystal:    { charges: 0, maxCharges: 0 },   // hits remaining; max for the level
+    echo:       { afterimages: [] },            // {x, y, age, life}
+    greed:      { lastDropAt: 0 },              // last score milestone we dropped at
+  };
+  game.greedSparkles = [];                       // {x, y, age, life}
+  applyMetaUpgrades(game.player, game.arena, game);
+  game.player.invuln = 1.0;
+  meta.runs++;
+}
+
+function endRun(survived){
+  if (game.scene !== 'playing' && game.scene !== 'dying') return;
+  const elapsed = game.runDuration - game.timeLeft;
+  let baseGained = game.runScore;
+  if (survived){
+    baseGained += Math.floor(500 * game.scoreMult);
+    if (elapsed > meta.bestTime) meta.bestTime = elapsed;
+  }
+  // prestige, modifier, and mode multipliers stack at banking. result screen shows the math.
+  const pMult = meta.prestigeMult || 1;
+  const mMult = (game.activeModifier && game.activeModifier.scoreMult) || 1;
+  const modeMult = game.runDuration === 90 ? 2.0 : game.runDuration === 60 ? 1.5 : 1.0;
+  const gained = Math.floor(baseGained * pMult * mMult * modeMult);
+  meta.totalScore += gained;
+  meta.totalEssence = (meta.totalEssence || 0) + game.runEssence;
+  saveMeta();
+  game.result.survived = survived;
+  game.result.time = elapsed;
+  game.result.score = game.runScore;
+  game.result.baseGained = baseGained;
+  game.result.gained = gained;
+  game.result.prestigeMult = pMult;
+  game.result.modifier = game.activeModifier;
+  game.result.modifierMult = mMult;
+  game.result.modeMult = modeMult;
+  game.result.runDuration = game.runDuration;
+  game.result.nearMisses = game.nearMissCount;
+  game.result.essence = game.runEssence;
+  game.result.cyan = game.cyanCount;
+  game.result.white = game.whiteCount;
+  game.result.gold = game.goldCount;
+  game.scene = 'result';
+  game.resultTimer = 0;
+}
+
+// ===== update =====
+function update(dt){
+  game.t += dt;
+  game.shake = Math.max(0, game.shake - dt*30);
+  game.flash = Math.max(0, game.flash - dt*3);
+  if (game.ascendAnim > 0) game.ascendAnim = Math.max(0, game.ascendAnim - dt);
+  if (game.shopMsgTimer > 0) game.shopMsgTimer -= dt;
+  if (game.resetTimer > 0){
+    game.resetTimer -= dt;
+    if (game.resetTimer <= 0){ game.resetState = 0; game.resetTimer = 0; }
+  }
+  if (game.scene === 'result') game.resultTimer += dt;
+
+  for (const s of stars){ s.tw += s.sp*dt; }
+
+  for (let i=game.particles.length-1; i>=0; i--){
+    const p = game.particles[i];
+    p.age += dt;
+    if (p.age >= p.life){ game.particles.splice(i,1); continue; }
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    p.vx *= 0.94; p.vy *= 0.94;
+  }
+
+  if (game.scene !== 'playing') return;
+  if (game.paused) return;
+
+  const p = game.player;
+
+  // damage flash decays after each hit
+  if (p.damageFlash > 0){
+    p.damageFlash = Math.max(0, p.damageFlash - dt * 2.2);
+    if (p.damageFlash === 0) p.recentLostSegment = -1;
+  }
+  p.displayHp = p.hp / p.maxHp;
+
+  // movement
+  let ix = 0, iy = 0;
+  if (keys['w']||keys['arrowup']) iy -= 1;
+  if (keys['s']||keys['arrowdown']) iy += 1;
+  if (keys['a']||keys['arrowleft']) ix -= 1;
+  if (keys['d']||keys['arrowright']) ix += 1;
+  if (ix||iy){ const m = Math.hypot(ix,iy); ix/=m; iy/=m; }
+
+  // trailing joystick base: when drag exceeds STICK_MAX, slide the base behind the
+  // cursor with per-frame lerp smoothing. Doing this here rather than in pointermove
+  // means the base updates at a steady 60fps instead of per-event (mouse fires far
+  // more often than touch, which made the base look like it was bouncing).
+  if (touch.active && !(meta.gyroEnabled && gyro.active)){
+    const tdx = touch.x - touch.bx;
+    const tdy = touch.y - touch.by;
+    const tlen = Math.hypot(tdx, tdy);
+    if (tlen > STICK_MAX){
+      const targetBx = touch.x - tdx/tlen * STICK_MAX;
+      const targetBy = touch.y - tdy/tlen * STICK_MAX;
+      touch.bx = lerp(touch.bx, targetBx, 0.5);
+      touch.by = lerp(touch.by, targetBy, 0.5);
+    }
+  }
+
+  // touch joystick — used unless gyro is the active mobile input
+  if (ix===0 && iy===0 && touch.active && !(meta.gyroEnabled && gyro.active)){
+    let dx = touch.x - touch.bx;
+    let dy = touch.y - touch.by;
+    const len = Math.hypot(dx, dy);
+    const DEADZONE = 6;        // tight — drift from a resting finger is rare with smoothing
+    if (len > DEADZONE){
+      // map past-deadzone distance to 0..1
+      const live = Math.min(STICK_MAX, len) - DEADZONE;
+      const fullRange = STICK_MAX - DEADZONE;
+      const linear = live / fullRange;
+      // mild power curve — close to linear at low end so you respond immediately,
+      // still slightly damped to give precision; pow 1.3 felt about right
+      const eased = Math.pow(linear, 1.3);
+      ix = (dx / len) * eased;
+      iy = (dy / len) * eased;
+    }
+  }
+
+  // gyro input (used in place of touch joystick when enabled)
+  if (ix===0 && iy===0 && meta.gyroEnabled && gyro.active){
+    const gx = clamp(gyro.gamma / GYRO_MAX_TILT, -1, 1);
+    const gy = clamp(gyro.beta / GYRO_MAX_TILT, -1, 1);
+    const gMag = Math.hypot(gx, gy);
+    if (gMag > 0.08){
+      const past = Math.min(1, (gMag - 0.08) / 0.92);
+      const eased = Math.pow(past, 1.3);
+      ix = (gx / gMag) * eased;
+      iy = (gy / gMag) * eased;
+    }
+  }
+
+  let speed = p.speed * resonanceMultiplier();
+
+  // snappier response: was 0.25, bumped to 0.38 for less mushy feel on mobile
+  p.vx = lerp(p.vx, ix*speed, 0.38);
+  p.vy = lerp(p.vy, iy*speed, 0.38);
+  p.x += p.vx*dt; p.y += p.vy*dt;
+
+  const dx = p.x-CX, dy = p.y-CY;
+  const d = Math.hypot(dx,dy);
+  const maxD = game.arena.radius - p.radius;
+  if (d > maxD){
+    p.x = CX + dx/d * maxD;
+    p.y = CY + dy/d * maxD;
+  }
+
+  game.trail.push({x:p.x, y:p.y, age:0});
+  if (game.trail.length > 16) game.trail.shift();
+  for (const t of game.trail) t.age += dt;
+
+  if (p.invuln > 0) p.invuln -= dt;
+
+  // combo update
+  const cb = game.combo;
+  cb.time += dt;
+  let newTier = 0, newMult = 1;
+  for (let i = COMBO_TIERS.length - 1; i >= 0; i--){
+    if (cb.time >= COMBO_TIERS[i].t){ newTier = i + 1; newMult = COMBO_TIERS[i].mult; break; }
+  }
+  if (newTier > cb.tier){
+    cb.tierFlash = 1;
+    ringBurst(p.x, p.y, '#5ee9ff', 14);
+  }
+  cb.tier = newTier;
+  cb.mult = newMult;
+  if (cb.tierFlash > 0) cb.tierFlash = Math.max(0, cb.tierFlash - dt * 1.8);
+  if (cb.breakFlash > 0) cb.breakFlash = Math.max(0, cb.breakFlash - dt * 1.6);
+
+  // run timer + scoring
+  game.timeLeft = Math.max(0, game.timeLeft - dt);
+
+  // wave system — recompute current wave from elapsed time. Each wave is its own 30s arc.
+  // Wave change triggers a 1.5s transition: spawn timer paused, wave label flashed.
+  // maxWave clamp prevents a one-frame wave-2 trigger at the very end of a 30s run.
+  const elapsedTotal = game.runDuration - game.timeLeft;
+  const maxWave = Math.floor((game.runDuration || 30) / 30);
+  const newWave = Math.min(maxWave, Math.floor(elapsedTotal / 30) + 1);
+  if (newWave !== game.wave){
+    game.lastWave = game.wave;
+    game.wave = newWave;
+    game.waveTransitionTimer = 1.5;
+    game.waveLabelTimer = 1.8;  // slightly longer than transition so it lingers
+    game.flash = 0.35;
+    game.flashColor = '#facc15';
+    ringBurst(CX, CY, '#facc15', 32);
+  }
+  // effective time-remaining within the current wave (used by unlockedTypes for the difficulty ramp)
+  game.waveTimeLeft = 30 - (elapsedTotal - (game.wave - 1) * 30);
+  if (game.waveTransitionTimer > 0) game.waveTransitionTimer = Math.max(0, game.waveTransitionTimer - dt);
+  if (game.waveLabelTimer > 0) game.waveLabelTimer = Math.max(0, game.waveLabelTimer - dt);
+  game.scoreAccum += dt;
+  // gold orb adds a x3 score multiplier for 3s after pickup
+  if (p.goldBoost > 0) p.goldBoost = Math.max(0, p.goldBoost - dt);
+  const goldMult = p.goldBoost > 0 ? 3 : 1;
+  const totalMult = game.scoreMult * cb.mult * goldMult;
+  while (game.scoreAccum >= 0.1){
+    game.scoreAccum -= 0.1;
+    game.scoreFloat += totalMult;
+  }
+  game.runScore = Math.floor(game.scoreFloat);
+
+  // orbs
+  updateOrbs(dt);
+  // passives (slipstream timer, magnet pull, edge slow tick)
+  updatePassives(dt);
+
+  // mid-run heals (mending upgrade)
+  if (game.mendingLevel >= 1 && !game.healed20 && game.timeLeft <= 20){
+    game.healed20 = true;
+    if (p.hp < p.maxHp){
+      p.hp++;
+      ringBurst(p.x, p.y, '#5ee9ff', 18);
+      burst(p.x, p.y, '#ffffff', 10, 2);
+    }
+  }
+  if (game.mendingLevel >= 2 && !game.healed10 && game.timeLeft <= 10){
+    game.healed10 = true;
+    if (p.hp < p.maxHp){
+      p.hp++;
+      ringBurst(p.x, p.y, '#5ee9ff', 18);
+      burst(p.x, p.y, '#ffffff', 10, 2);
+    }
+  }
+
+  // spawn
+  game.spawnTimer -= dt;
+  const tProg = 1 - game.timeLeft/game.runDuration;
+  // floor bumped from 0.42 → 0.55 so late-game has a breathable tempo.
+  // voidspace still compresses this; density cap below bounds the worst case.
+  // tProg now uses wave-local progress so each wave's spawn ramp resets fresh.
+  const waveTProg = 1 - (game.waveTimeLeft || game.timeLeft) / 30;
+  const baseInterval = clamp(0.85 - waveTProg*0.43, 0.55, 0.95);
+  const interval = baseInterval / ((game.spawnRateMult || 1) * (game.modifierSpawnMult || 1));
+  // density cap: modifier override → wave-based default ([12, 14, 16] for waves 1/2/3) → MAX_DENSITY fallback.
+  const waveCap = [12, 14, 16][(game.wave || 1) - 1] || MAX_DENSITY;
+  const cap = game.modifierMaxDensity || waveCap;
+  // skip spawn block during the brief wave-transition breath so the player gets a moment between waves
+  if (game.waveTransitionTimer <= 0 && game.spawnTimer <= 0 && game.timeLeft > 0.3){
+    if (game.enemies.length >= cap){
+      // capped — quick retry once enemies die or leave the arena.
+      game.spawnTimer = 0.15;
+    } else {
+      spawnEnemy();
+      // bonus rolls also density-gated so a near-cap state doesn't punch +2 through.
+      if (waveTProg > 0.30 && Math.random() < 0.30 && game.enemies.length < cap) spawnEnemy();
+      if (waveTProg > 0.65 && Math.random() < 0.35 && game.enemies.length < cap) spawnEnemy();
+      game.spawnTimer = interval * rand(0.85, 1.15);
+    }
+  }
+
+  // enemies
+  for (let i=game.enemies.length-1; i>=0; i--){
+    const e = game.enemies[i];
+    if (!e.active){
+      e.warning -= dt;
+      if (e.warning <= 0){
+        e.active = true;
+        e.born = true;
+        ringBurst(e.x, e.y, e.color, e.type==='sniper' ? 18 : 10);
+      }
+      continue;
+    }
+    let eDt = dt * comboSlowFactor();
+    if (enemySlowed()) eDt *= EDGE_SLOW_FACTOR;
+    e.behavior(e, eDt, p);
+    e.age += dt;
+
+    if (e.type === 'tracker' || e.type === 'sniper'){
+      if (Math.random() < 0.5){
+        game.particles.push({x:e.x+rand(-2,2), y:e.y+rand(-2,2), vx:0, vy:0, life:.3, age:0, r:rand(.6,1.4), color:e.color});
+      }
+    }
+
+    if (e.dead){ game.enemies.splice(i,1); continue; }
+
+    // collision + near-miss tracking
+    const cd = dist(e.x, e.y, p.x, p.y);
+    const collisionDist = e.radius + p.radius;
+    const margin = cd - collisionDist;
+
+    if (p.invuln <= 0 && margin < 0){
+      damagePlayer();
+      burst(e.x, e.y, e.color, 14, 2);
+      const ang = Math.atan2(e.y-p.y, e.x-p.x);
+      e.vx = Math.cos(ang)*200; e.vy = Math.sin(ang)*200;
+    } else if (!e.creditedNear){
+      // track minimum margin observed; credit when enemy moves clearly away after coming close
+      if (e.minMargin === undefined) e.minMargin = margin;
+      else if (margin < e.minMargin) e.minMargin = margin;
+      if (e.minMargin > 0 && e.minMargin < NEAR_MISS_PX && margin > NEAR_MISS_PX){
+        // SHIELDED — direction-aware. Compute angle from enemy to player relative to enemy's
+        // velocity (the shield's facing). Front cone (±60°) blocks credit; back-pass earns 2x.
+        if (e.type === 'shielded'){
+          const enemyToPlayer = Math.atan2(p.y - e.y, p.x - e.x);
+          const facingDir = Math.atan2(e.vy, e.vx);
+          let angleDiff = enemyToPlayer - facingDir;
+          while (angleDiff > Math.PI) angleDiff -= TAU;
+          while (angleDiff < -Math.PI) angleDiff += TAU;
+          e.creditedNear = true;
+          if (Math.abs(angleDiff) >= Math.PI/3) awardNearMiss(e, 2);  // back-side only
+        } else {
+          e.creditedNear = true;
+          awardNearMiss(e);
+        }
+      }
+    }
+
+    if (dist(e.x, e.y, CX, CY) > game.arena.radius + 240){
+      game.enemies.splice(i,1);
+    }
+  }
+
+  if (game.timeLeft <= 0){
+    endRun(true);
+  }
+}
+
+function damagePlayer(){
+  const p = game.player;
+  if (p.invuln > 0) return;
+
+  // CRYSTAL — absorbs the hit if charged. No HP loss, no combo break, brief invuln.
+  if (game.passive.crystal.charges > 0){
+    game.passive.crystal.charges--;
+    p.invuln = 0.5;
+    game.shake = 4;
+    game.flash = 0.25;
+    game.flashColor = '#5ee9ff';
+    // shimmer burst — implies the crystal shattered
+    ringBurst(p.x, p.y, '#5ee9ff', 26);
+    burst(p.x, p.y, '#ffffff', 14, 2);
+    return;
+  }
+
+  p.hp--;
+  p.recentLostSegment = p.hp; // 0-indexed: segment that just emptied
+  p.damageFlash = 1;
+  p.displayHp = p.hp / p.maxHp;
+  p.invuln = 0.95 + game.iframeBonus;
+  game.shake = 8;
+  game.flash = 0.45;
+  game.flashColor = '#ff6b8a';
+  // combo partial-break — drop one tier per hit instead of zeroing.
+  // keeps recovery possible without making hits painless: high-tier runs still
+  // cost real time to (re)build, sloppy runs still pay a real per-hit cost.
+  if (game.combo.tier > 0){
+    game.combo.breakFlash = 1;
+    const newTier = game.combo.tier - 1;
+    game.combo.tier = newTier;
+    if (newTier === 0){
+      game.combo.time = 0;
+      game.combo.mult = 1;
+    } else {
+      const tdef = COMBO_TIERS[newTier - 1];
+      game.combo.time = tdef.t;
+      game.combo.mult = tdef.mult;
+    }
+  }
+  ringBurst(p.x, p.y, '#ff6b8a', 22);
+  if (p.hp <= 0){
+    // Phoenix passive — intercept death once per run
+    const phoenixLvl = activePassiveLevel('phoenix');
+    if (phoenixLvl > 0 && !game.passive.phoenix.used){
+      game.passive.phoenix.used = true;
+      const reviveHP = [1, 2, 2][phoenixLvl-1];
+      const invulnDur = [1.5, 2.0, 2.5][phoenixLvl-1];
+      p.hp = Math.min(reviveHP, p.maxHp);
+      p.displayHp = p.hp / p.maxHp;
+      p.invuln = invulnDur;
+      // celebratory burst
+      ringBurst(p.x, p.y, '#facc15', 28);
+      burst(p.x, p.y, '#facc15', 22, 3);
+      burst(p.x, p.y, '#ffffff', 14, 2);
+      game.flash = 0.5;
+      game.flashColor = '#facc15';
+      return;
+    }
+    p.hp = 0;
+    burst(p.x, p.y, '#5ee9ff', 36, 4);
+    burst(p.x, p.y, '#ffffff', 18, 3);
+    game.scene = 'dying';
+    setTimeout(()=>{ if (game.scene === 'dying') endRun(false); }, 500);
+  }
+}
+
+// ===== render =====
+function render(){
+  ctx.fillStyle = '#060810';
+  ctx.fillRect(0,0,W,H);
+
+  let sx=0, sy=0;
+  if (game.shake > 0){
+    sx = rand(-1,1)*game.shake*0.4;
+    sy = rand(-1,1)*game.shake*0.4;
+  }
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  drawStars();
+  game.buttonHits.length = 0;
+
+  if (game.scene === 'menu'){
+    drawArenaBackdrop();
+    drawArena(false);
+    drawMenu();
+  } else if (game.scene === 'shop'){
+    drawArenaBackdrop();
+    drawArena(false);
+    drawShop();
+  } else if (game.scene === 'modifierPick'){
+    drawArenaBackdrop();
+    drawArena(false);
+    drawModifierPick();
+  } else {
+    drawArenaBackdrop();
+    drawArena(true);
+    drawTrail();
+    drawPassiveEffects();
+    drawOrbs();
+    drawEnemies();
+    drawWarnings();
+    drawParticles();
+    drawPlayer();
+    if (!game.paused) drawJoystick();
+    if (game.scene === 'playing' || game.scene === 'dying' || game.scene === 'result') drawHUD();
+    if (game.scene === 'result') drawResult();
+    if (game.scene === 'playing' && !game.paused) drawPauseButton();
+    if (game.paused) drawPauseOverlay();
+  }
+
+  ctx.restore();
+  drawFlash();
+}
+
+function drawStars(){
+  for (const s of stars){
+    const a = 0.3 + 0.5*(0.5+0.5*Math.sin(s.tw));
+    ctx.globalAlpha = a*s.p;
+    ctx.fillStyle = '#cfd8ff';
+    ctx.beginPath();
+    ctx.arc(s.x*W, s.y*H, s.r, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawArenaBackdrop(){
+  const r = game.arena.radius;
+  const grad = ctx.createRadialGradient(CX, CY, r*0.5, CX, CY, r*1.5);
+  grad.addColorStop(0, 'rgba(94,233,255,0.0)');
+  grad.addColorStop(0.7, 'rgba(94,233,255,0.04)');
+  grad.addColorStop(1, 'rgba(94,233,255,0.0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,W,H);
+}
+
+function drawArena(showTimer){
+  const r = game.arena.radius;
+  const grad = ctx.createRadialGradient(CX, CY, 0, CX, CY, r);
+  grad.addColorStop(0, 'rgba(20,28,55,0.0)');
+  grad.addColorStop(0.85, 'rgba(20,28,55,0.18)');
+  grad.addColorStop(1, 'rgba(94,127,214,0.18)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(CX, CY, r, 0, TAU);
+  ctx.fill();
+
+  ctx.shadowColor = 'rgba(94,233,255,0.7)';
+  ctx.shadowBlur = 22;
+  ctx.strokeStyle = 'rgba(94,233,255,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(CX, CY, r, 0, TAU);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  ctx.strokeStyle = 'rgba(186,230,253,0.85)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(CX, CY, r-0.5, 0, TAU);
+  ctx.stroke();
+
+  // rotating reticle ticks outside the boundary
+  const ticks = 60;
+  const rot = game.t * 0.05;
+  for (let i=0;i<ticks;i++){
+    const a = (i/ticks)*TAU + rot;
+    const major = i % 5 === 0;
+    const len = major ? 12 : 4;
+    const x1 = CX + Math.cos(a)*(r+5);
+    const y1 = CY + Math.sin(a)*(r+5);
+    const x2 = CX + Math.cos(a)*(r+5+len);
+    const y2 = CY + Math.sin(a)*(r+5+len);
+    ctx.strokeStyle = major ? 'rgba(94,233,255,0.55)' : 'rgba(94,233,255,0.18)';
+    ctx.lineWidth = major ? 1.2 : 0.8;
+    ctx.beginPath();
+    ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+    ctx.stroke();
+  }
+
+  if (showTimer){
+    const frac = clamp(game.timeLeft / game.runDuration, 0, 1);
+    const angStart = -Math.PI/2;
+    const danger = game.timeLeft < 8;
+    ctx.strokeStyle = danger ? 'rgba(255,154,63,0.8)' : 'rgba(94,233,255,0.7)';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(CX, CY, r-10, angStart, angStart + frac*TAU);
+    ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+}
+
+function drawTrail(){
+  if (!game.player) return;
+  for (let i=0;i<game.trail.length;i++){
+    const t = game.trail[i];
+    const a = (i / game.trail.length) * 0.45;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#5ee9ff';
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, game.player.radius * (i/game.trail.length) * 0.85, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPlayer(){
+  if (!game.player) return;
+  const p = game.player;
+  if (p.hp <= 0 && game.scene === 'dying') return;
+
+  // Magnet range — visible only while player has the passive equipped (faint dotted ring)
+  const magLvl = activePassiveLevel('magnet');
+  if (magLvl > 0){
+    const range = MAGNET_RANGE[magLvl-1];
+    ctx.strokeStyle = `rgba(94,233,255,${0.10 + 0.05*Math.sin(game.t*1.5)})`;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 6]);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, range, 0, TAU);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Slipstream active — pulsing cyan aura close around player to show "you're smaller right now"
+  if (game.passive && game.passive.slipstream && game.passive.slipstream.active > 0){
+    const s = game.passive.slipstream.active;
+    const slipLvl = activePassiveLevel('slipstream') || 1;
+    const max = SLIPSTREAM_DURATION[slipLvl-1];
+    const intensity = clamp(s / max, 0, 1);
+    const auraR = p.radius + 6 + 2*Math.sin(game.t*8);
+    const grad = ctx.createRadialGradient(p.x, p.y, p.radius, p.x, p.y, auraR + 8);
+    grad.addColorStop(0, `rgba(94,233,255,${0.5 * intensity})`);
+    grad.addColorStop(1, `rgba(94,233,255,0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, auraR + 8, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(94,233,255,${0.55 * intensity})`;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, auraR, 0, TAU);
+    ctx.stroke();
+  }
+
+  // Crystal shield — faceted cyan ring(s) around player, one per charge
+  if (game.passive && game.passive.crystal && game.passive.crystal.charges > 0){
+    const charges = game.passive.crystal.charges;
+    const facets = 6;
+    const baseR = p.radius + 9;
+    for (let c = 0; c < charges; c++){
+      const ringR = baseR + c * 4;     // outer ring spaced from inner
+      const wobble = 1.5 * Math.sin(game.t * 4 + c * 1.7);
+      const rot = game.t * 0.6 + c * 0.5;
+      ctx.strokeStyle = `rgba(94,233,255,${0.65 + 0.2*Math.sin(game.t*5 + c)})`;
+      ctx.lineWidth = 1.4;
+      ctx.shadowColor = '#5ee9ff';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      for (let i=0;i<=facets;i++){
+        const a = (i/facets) * TAU + rot;
+        const r = ringR + (i%2===0 ? wobble : -wobble);
+        const x = p.x + Math.cos(a) * r;
+        const y = p.y + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  // prestige aura — subtle gold halo unlocked at rank 3, intensifies with higher ranks.
+  // drawn under the combo aura so they layer cleanly when a high-prestige player gets a combo.
+  const prank = meta.prestige || 0;
+  if (prank >= 3){
+    const intensity = Math.min(1, (prank - 2) / 7);  // smooth ramp from rank 3 to rank ~10
+    const pulse = 0.7 + 0.3 * Math.sin(game.t * 1.8);
+    const auraR = p.radius + 22 + intensity * 5;
+    const grad = ctx.createRadialGradient(p.x, p.y, p.radius - 2, p.x, p.y, auraR);
+    grad.addColorStop(0, `rgba(250,204,21,${0.10 * intensity * pulse})`);
+    grad.addColorStop(0.7, `rgba(250,204,21,${0.04 * intensity * pulse})`);
+    grad.addColorStop(1, 'rgba(250,204,21,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, auraR, 0, TAU);
+    ctx.fill();
+  }
+
+  // combo aura — drawn beneath everything so it feels like a presence around you
+  const cb = game.combo;
+  if (cb.tier >= 2){
+    const auraR = p.radius + 14 + (cb.tier === 3 ? 6 + 3*Math.sin(game.t*5) : 0);
+    const auraColor = cb.tier === 3 ? '255,210,74' : '94,233,255';
+    const grad = ctx.createRadialGradient(p.x, p.y, p.radius, p.x, p.y, auraR);
+    grad.addColorStop(0, `rgba(${auraColor},0)`);
+    grad.addColorStop(0.6, `rgba(${auraColor},0.10)`);
+    grad.addColorStop(1, `rgba(${auraColor},0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, auraR, 0, TAU);
+    ctx.fill();
+    // thin pulsing ring at tier 3
+    if (cb.tier === 3){
+      ctx.strokeStyle = `rgba(${auraColor},${0.25 + 0.15*Math.sin(game.t*5)})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, auraR - 3, 0, TAU);
+      ctx.stroke();
+    }
+  }
+
+  const flicker = p.invuln > 0 ? (Math.sin(game.t*30) > 0 ? 0.6 : 1) : 1;
+  ctx.globalAlpha = flicker;
+
+  const segs = Math.max(1, p.maxHp);
+  const segArc = TAU / segs;
+  // narrower gap when many segments so they stay readable
+  const gap = Math.min(0.12, segArc * 0.18);
+
+  // soft halo behind the whole ring (gives the cyan glow at all HP states)
+  ctx.shadowColor = '#5ee9ff';
+  ctx.shadowBlur = 18;
+  ctx.strokeStyle = 'rgba(94,233,255,0.20)';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, p.radius, 0, TAU);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // segments: filled = HP remaining, faded = lost, recently-lost flashes red
+  for (let i=0;i<segs;i++){
+    const a1 = -Math.PI/2 + i * segArc + gap/2;
+    const a2 = -Math.PI/2 + (i+1) * segArc - gap/2;
+    const filled = i < p.hp;
+    const justLost = !filled && (i === p.recentLostSegment) && p.damageFlash > 0;
+
+    if (justLost){
+      const f = p.damageFlash;
+      ctx.shadowColor = '#ff6b8a';
+      ctx.shadowBlur = 18 * f;
+      ctx.strokeStyle = `rgba(255,107,138,${0.25 + 0.75*f})`;
+      ctx.lineWidth = 2.5 + 2 * f;
+    } else if (filled){
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = '#5ee9ff';
+      ctx.lineWidth = 2.8;
+    } else {
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = 'rgba(94,233,255,0.15)';
+      ctx.lineWidth = 1.4;
+    }
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.radius, a1, a2);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // inner core: scales with HP/maxHp instantly, tints red briefly on hit
+  const innerR = p.radius * 0.62 * (p.hp / p.maxHp);
+  if (innerR > 0.5){
+    const f = p.damageFlash;
+    if (f > 0){
+      ctx.shadowColor = '#ff6b8a';
+      ctx.shadowBlur = 14 + f*8;
+      const g = Math.floor(255 - f*148);
+      const b = Math.floor(255 - f*117);
+      ctx.fillStyle = `rgb(255, ${g}, ${b})`;
+    } else {
+      ctx.shadowColor = '#ffffff';
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = '#ffffff';
+    }
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, innerR, 0, TAU);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+function drawJoystick(){
+  if (!touch.active) return;
+  // outer base ring
+  ctx.globalAlpha = 0.55;
+  ctx.fillStyle = 'rgba(15,20,35,0.45)';
+  ctx.beginPath();
+  ctx.arc(touch.bx, touch.by, STICK_MAX, 0, TAU);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(232,235,242,0.55)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(touch.bx, touch.by, STICK_MAX, 0, TAU);
+  ctx.stroke();
+  // tiny center dot
+  ctx.fillStyle = 'rgba(232,235,242,0.35)';
+  ctx.beginPath();
+  ctx.arc(touch.bx, touch.by, 2, 0, TAU);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // stick knob (clamped)
+  let dx = touch.x - touch.bx;
+  let dy = touch.y - touch.by;
+  const len = Math.hypot(dx, dy);
+  if (len > STICK_MAX){ dx = dx/len*STICK_MAX; dy = dy/len*STICK_MAX; }
+  const sx = touch.bx + dx, sy = touch.by + dy;
+
+  ctx.shadowColor = '#5ee9ff';
+  ctx.shadowBlur = 16;
+  ctx.fillStyle = 'rgba(94,233,255,0.6)';
+  ctx.beginPath();
+  ctx.arc(sx, sy, 26, 0, TAU);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = '#5ee9ff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(sx, sy, 26, 0, TAU);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.beginPath();
+  ctx.arc(sx, sy, 5, 0, TAU);
+  ctx.fill();
+}
+
+function drawOrbs(){
+  for (const o of game.orbs){
+    const def = ORB[o.type];
+    // alpha based on state
+    let alpha = 1;
+    if (o.state === 'fadeIn'){
+      alpha = clamp(o.stateTime / def.fadeIn, 0, 1);
+    } else if (o.state === 'fadeOut'){
+      alpha = 1 - clamp(o.stateTime / def.fadeOut, 0, 1);
+    }
+    // urgency: when over half through lifetime, accelerate the pulse and add flicker
+    let urgency = 0;
+    if (o.state === 'live'){
+      const half = def.lifetime * 0.5;
+      if (o.stateTime > half){
+        urgency = (o.stateTime - half) / (def.lifetime - half);
+      }
+    } else if (o.state === 'fadeOut'){
+      urgency = 1;
+    }
+    const pulseHz = def.pulseSpeed + urgency * 6;
+    const pulse = 0.5 + 0.5 * Math.sin(o.age * pulseHz);
+    // late-stage flicker
+    let flicker = 1;
+    if (urgency > 0.5){
+      flicker = 0.7 + 0.3 * (Math.sin(o.age * 22) > 0 ? 1 : 0);
+    }
+
+    ctx.globalAlpha = alpha * flicker;
+
+    // outer glow halo (sets the orb apart from solid enemies)
+    const haloR = o.radius + 6 + pulse * 3;
+    const grad = ctx.createRadialGradient(o.x, o.y, o.radius, o.x, o.y, haloR);
+    grad.addColorStop(0, def.color + '00');
+    grad.addColorStop(0.5, def.color + '44');
+    grad.addColorStop(1, def.color + '00');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, haloR, 0, TAU);
+    ctx.fill();
+
+    // hollow outer ring — the visual signature
+    ctx.shadowColor = def.color;
+    ctx.shadowBlur = 12;
+    ctx.strokeStyle = def.color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, o.radius, 0, TAU);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // rotating orbit ring (different from enemy bouncer dashes)
+    const orbitR = o.radius + 3;
+    const orbitAng = o.age * (o.type === 'gold' ? 2.5 : 1.6);
+    ctx.strokeStyle = def.color;
+    ctx.globalAlpha = alpha * flicker * 0.4;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, orbitR, orbitAng, orbitAng + Math.PI * 0.6);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, orbitR, orbitAng + Math.PI, orbitAng + Math.PI * 1.6);
+    ctx.stroke();
+    ctx.globalAlpha = alpha * flicker;
+
+    // inner pulsing core dot
+    const coreR = (o.type === 'gold' ? 3.5 : 2.8) * (0.6 + pulse * 0.5);
+    ctx.fillStyle = def.color;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, coreR, 0, TAU);
+    ctx.fill();
+
+    // symbol — pure white, centered
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '300 11px "Fraunces",serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(def.symbol, o.x, o.y + 0.5);
+    ctx.textBaseline = 'alphabetic';
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPassiveEffects(){
+  // Pulse shockwaves — expanding rings from player
+  if (game.pulseEffects){
+    for (const fx of game.pulseEffects){
+      const fade = clamp(1 - fx.age / 0.5, 0, 1);
+      ctx.strokeStyle = `rgba(94,233,255,${0.7 * fade})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(fx.x, fx.y, fx.r, 0, TAU);
+      ctx.stroke();
+      ctx.strokeStyle = `rgba(94,233,255,${0.3 * fade})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(fx.x, fx.y, fx.r * 0.85, 0, TAU);
+      ctx.stroke();
+    }
+  }
+
+  // Echo afterimages — subtle ghost player markers
+  if (game.passive && game.passive.echo && game.passive.echo.afterimages.length > 0){
+    for (const a of game.passive.echo.afterimages){
+      const lifeFrac = clamp(1 - a.age / a.life, 0, 1);
+      const flicker = 0.5 + 0.5 * Math.sin(a.age * 14);
+      const alpha = lifeFrac * (0.4 + 0.3 * flicker);
+      ctx.shadowColor = '#5ee9ff';
+      ctx.shadowBlur = 10 * lifeFrac;
+      ctx.strokeStyle = `rgba(94,233,255,${alpha})`;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, 11, 0, TAU);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      // inner core
+      ctx.fillStyle = `rgba(255,255,255,${alpha * 0.5})`;
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, 4 * lifeFrac, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  // Greed sparkles — small bobbing diamonds, fade in last second
+  if (game.greedSparkles && game.greedSparkles.length > 0){
+    for (const s of game.greedSparkles){
+      const remain = s.life - s.age;
+      const fadeAlpha = remain < 1.2 ? remain / 1.2 : 1;
+      const bob = Math.sin(s.age * 4 + s.x * 0.05) * 1.5;
+      const pulse = 0.6 + 0.4 * Math.sin(s.age * 6);
+      ctx.globalAlpha = fadeAlpha;
+      ctx.shadowColor = '#5ee9ff';
+      ctx.shadowBlur = 8 * pulse;
+      ctx.fillStyle = '#5ee9ff';
+      // little diamond
+      const sx = s.x, sy = s.y + bob;
+      const r = 3 + pulse * 1.2;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy - r);
+      ctx.lineTo(sx + r, sy);
+      ctx.lineTo(sx, sy + r);
+      ctx.lineTo(sx - r, sy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(sx, sy, 1.2, 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawEnemies(){
+  for (const e of game.enemies){
+    if (!e.active) continue;
+
+    // FIELD — damage zone visual: outline ring + translucent fill + center marker.
+    // During fading phase, fade alpha and use the remembered visual radius.
+    if (e.type === 'field'){
+      const fadeAlpha = e.zonePhase === 'fading' ? Math.max(0, 1 - e.phaseTime/0.5) : 1;
+      const visR = e.zoneVisualRadius || e.radius;
+      const pulse = 0.4 + 0.2 * Math.sin(game.t * 4);
+      ctx.strokeStyle = `rgba(251,146,60,${0.6 * fadeAlpha})`;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = e.color;
+      ctx.shadowBlur = 12 * fadeAlpha;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, visR, 0, TAU);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = `rgba(251,146,60,${0.18 * pulse * fadeAlpha})`;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, visR, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = `rgba(255,224,180,${0.9 * fadeAlpha})`;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, 4, 0, TAU);
+      ctx.fill();
+      continue;
+    }
+
+    // SHIELDED — body + thick shield arc on the front (facing velocity).
+    if (e.type === 'shielded'){
+      ctx.shadowColor = e.color;
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = e.color;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius, 0, TAU);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius*0.55, 0, TAU);
+      ctx.fill();
+      const faceAng = Math.atan2(e.vy, e.vx);
+      const shieldR = e.radius + 4;
+      ctx.strokeStyle = '#fff7c2';
+      ctx.lineWidth = 2.5;
+      ctx.shadowColor = e.color;
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, shieldR, faceAng - Math.PI/3, faceAng + Math.PI/3);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      continue;
+    }
+
+    ctx.shadowColor = e.color;
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = e.color;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.radius, 0, TAU);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.radius*0.55, 0, TAU);
+    ctx.fill();
+    if (e.type === 'bouncer'){
+      ctx.strokeStyle = e.color;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2,2]);
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius+4, 0, TAU);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+}
+
+function drawWarnings(){
+  for (const e of game.enemies){
+    if (e.active) continue;
+    const t = 1 - e.warning / e.warningMax;
+    const pulse = 0.4 + 0.6*Math.abs(Math.sin(game.t*10));
+    // FIELD warning — strong outline ring at full zone radius. Player needs to clearly see
+    // where the damage zone will be so they have time to vacate.
+    if (e.type === 'field'){
+      const fastPulse = 0.5 + 0.5*Math.abs(Math.sin(game.t*8));
+      ctx.strokeStyle = `rgba(251,146,60,${0.30 + 0.50*fastPulse*t})`;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5,5]);
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius, 0, TAU);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = `rgba(251,146,60,${0.06 + 0.08*t})`;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = `rgba(255,224,180,${0.5 + 0.4*t})`;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, 3, 0, TAU);
+      ctx.fill();
+      continue;
+    }
+    const ang = Math.atan2(e.vy, e.vx);
+    if (e.type === 'sniper'){
+      const ex = e.x + Math.cos(ang)*1400;
+      const ey = e.y + Math.sin(ang)*1400;
+      ctx.strokeStyle = `rgba(239,68,68,${0.18 + 0.5*pulse*t})`;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6,4]);
+      ctx.beginPath();
+      ctx.moveTo(e.x, e.y); ctx.lineTo(ex, ey);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = `rgba(239,68,68,${0.6 + 0.3*pulse})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius * (1 + (1-t)*0.8), 0, TAU);
+      ctx.stroke();
+    } else {
+      const len = 110;
+      const ex = e.x + Math.cos(ang)*len;
+      const ey = e.y + Math.sin(ang)*len;
+      ctx.strokeStyle = `rgba(255,230,109,${0.22 + 0.4*pulse*t})`;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4,5]);
+      ctx.beginPath();
+      ctx.moveTo(e.x, e.y); ctx.lineTo(ex, ey);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = `rgba(255,230,109,${0.4+0.5*pulse})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius*(1+(1-t)*0.6), 0, TAU);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawParticles(){
+  for (const p of game.particles){
+    const a = 1 - p.age/p.life;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPauseButton(){
+  // small unobtrusive icon in the top-left corner
+  // sized to fit above the essence display (which baselines at y=36)
+  const x = 10, y = 8, size = 24;
+  const cx = x + size/2, cy = y + size/2;
+  const hov = mx>=x && mx<=x+size && my>=y && my<=y+size;
+
+  ctx.fillStyle = hov ? 'rgba(232,235,242,0.08)' : 'rgba(15,20,35,0.4)';
+  ctx.strokeStyle = hov ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.28)';
+  ctx.lineWidth = 1;
+  roundRect(x, y, size, size, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  // pause symbol — two thin vertical bars
+  ctx.fillStyle = hov ? '#e8ebf2' : 'rgba(232,235,242,0.6)';
+  const barW = 2.2, barH = 10, gap = 3;
+  ctx.fillRect(cx - gap/2 - barW, cy - barH/2, barW, barH);
+  ctx.fillRect(cx + gap/2,        cy - barH/2, barW, barH);
+
+  game.buttonHits.push({ x, y, w:size, h:size, action: pauseGame });
+}
+
+function drawPauseOverlay(){
+  // dim layer
+  ctx.fillStyle = 'rgba(6,8,16,0.78)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#5ee9ff';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('— PAUSED —', CX, CY - 60);
+
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = '300 italic 56px "Fraunces",serif';
+  ctx.fillText('Paused.', CX, CY);
+
+  ctx.fillStyle = 'rgba(232,235,242,0.55)';
+  ctx.font = '300 12px "IBM Plex Mono",monospace';
+  ctx.fillText('tap anywhere to resume', CX, CY + 48);
+
+  // tapping anywhere resumes — clear other hit areas first
+  game.buttonHits.length = 0;
+  game.buttonHits.push({ x:0, y:0, w:W, h:H, action: resumeGame });
+}
+
+function drawHUD(){
+  // wave label flash — appears briefly at wave 2 / wave 3 transitions to mark the threshold
+  if (game.waveLabelTimer > 0 && game.wave >= 2){
+    const t = game.waveLabelTimer;
+    // ramp in over first 0.3s then hold then fade out — peak alpha around mid-life
+    const phaseIn = Math.min(1, (1.8 - t) / 0.3);
+    const phaseOut = Math.min(1, t / 0.6);
+    const alpha = Math.max(0, Math.min(phaseIn, phaseOut));
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(250,204,21,${0.85 * alpha})`;
+    ctx.font = '300 italic 64px "Fraunces",serif';
+    ctx.shadowColor = '#facc15';
+    ctx.shadowBlur = 24 * alpha;
+    ctx.fillText('WAVE  ' + game.wave, CX, CY - 40);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = `rgba(232,235,242,${0.55 * alpha})`;
+    ctx.font = '300 12px "IBM Plex Mono",monospace';
+    const subtitle = game.wave === 2 ? '— FIELD HAZARDS ENTER —' : '— SHIELDED FOES ENTER —';
+    ctx.fillText(subtitle, CX, CY - 8);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('TIME', CX, 36);
+  const tl = game.timeLeft;
+  const danger = tl < 8;
+  ctx.fillStyle = danger ? '#ff9a3f' : '#e8ebf2';
+  ctx.font = `300 italic 48px "Fraunces",serif`;
+  ctx.fillText(tl.toFixed(1), CX, 86);
+
+  // essence (top-left) — only after first pickup this run
+  if (game.runEssence > 0){
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(232,235,242,0.5)';
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    ctx.fillText('ESSENCE', 28, 36);
+    ctx.fillStyle = '#5ee9ff';
+    ctx.font = '400 22px "IBM Plex Mono",monospace';
+    ctx.fillText(String(game.runEssence).padStart(2,'0'), 28, 60);
+  }
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('SCORE', W-28, 36);
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = '400 22px "IBM Plex Mono",monospace';
+  ctx.fillText(String(game.runScore).padStart(3,'0'), W-28, 60);
+
+  // combo multiplier (only when active or just broken)
+  const cb = game.combo;
+  if (cb.tier > 0 || cb.breakFlash > 0){
+    let label, color, baseSize;
+    if (cb.breakFlash > 0){
+      label = '×1.0';
+      const bf = cb.breakFlash;
+      color = `rgba(255,107,138,${0.4 + 0.6*bf})`;
+      baseSize = 16 + 8*bf;
+    } else {
+      label = '×' + cb.mult.toFixed(1);
+      if (cb.tier >= 3) color = '#ffd24a';
+      else if (cb.tier >= 2) color = '#5ee9ff';
+      else color = 'rgba(186,230,253,0.9)';
+      baseSize = 14 + cb.tier*2 + cb.tierFlash*8;
+    }
+    ctx.fillStyle = color;
+    ctx.font = `400 italic ${baseSize}px "Fraunces",serif`;
+    ctx.fillText(label, W-28, 86);
+  }
+
+  // gold orb boost indicator — visible when active, around the player area
+  const p = game.player;
+  if (p && p.goldBoost > 0){
+    ctx.textAlign = 'center';
+    const boostFrac = p.goldBoost / 3;
+    ctx.fillStyle = `rgba(250,204,21,${0.4 + 0.6*boostFrac})`;
+    ctx.font = '400 italic 16px "Fraunces",serif';
+    ctx.fillText('×3 BOOST  ' + p.goldBoost.toFixed(1) + 's', CX, 110);
+  }
+}
+
+function drawMenu(){
+  const ownedAny = Object.values(meta.passives || {}).some(v => v > 0);
+  const showLoadout = ownedAny;
+
+  // central icon
+  const pulse = 6 + 2*Math.sin(game.t*2);
+  const iconY = showLoadout ? CY - 80 : CY - 10;
+  ctx.shadowColor = '#5ee9ff';
+  ctx.shadowBlur = 26;
+  ctx.strokeStyle = '#5ee9ff';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(CX, iconY, 18+pulse*0.2, 0, TAU);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(CX, iconY, 8, 0, TAU);
+  ctx.fill();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = '300 italic 96px "Fraunces",serif';
+  ctx.fillText('Bound', CX, iconY - 60);
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('A · DODGE · ROGUELIKE', CX, iconY - 26);
+
+  ctx.fillStyle = '#5ee9ff';
+  ctx.font = '300 italic 20px "Fraunces",serif';
+  const essBanked = meta.totalEssence || 0;
+  if (essBanked > 0){
+    ctx.fillText(formatScore(meta.totalScore) + ' score · ' + essBanked + ' essence banked', CX, iconY + 60);
+  } else {
+    ctx.fillText(formatScore(meta.totalScore) + ' score banked', CX, iconY + 60);
+  }
+
+  // prestige rank indicator — always visible after first ascend, hidden otherwise to keep menu clean for new players
+  if ((meta.prestige || 0) > 0){
+    const pulse = 0.85 + 0.15 * Math.sin(game.t * 1.4);
+    ctx.fillStyle = `rgba(250,204,21,${pulse})`;
+    ctx.font = '300 italic 13px "Fraunces",serif';
+    ctx.fillText('▲  PRESTIGE  RANK  ' + meta.prestige + '  ·  ' + (meta.prestigeMult || 1).toFixed(2) + 'x  score', CX, iconY + 82);
+  }
+
+  const narrow = W < 540;
+  let by;
+  if (narrow){
+    const bw = Math.min(280, W-48), bh = 48;
+    by = iconY + 96;
+    drawButton(CX-bw/2, by, bw, bh, 'BEGIN  RUN', beginRun, true);
+    drawButton(CX-bw/2, by + bh + 12, bw, bh, 'UPGRADES', openShop, false);
+    by = by + bh*2 + 12;
+  } else {
+    const bw = 200, bh = 48, gap = 20;
+    const totalW = bw*2 + gap;
+    const baseX = CX - totalW/2;
+    by = iconY + 100;
+    drawButton(baseX, by, bw, bh, 'BEGIN  RUN', beginRun, true);
+    drawButton(baseX+bw+gap, by, bw, bh, 'UPGRADES', openShop, false);
+    by = by + bh;
+  }
+
+  // mode toggle — only shown when at least one extended mode is unlocked.
+  // Single tap-to-cycle line keeps the menu uncluttered while still surfacing the choice.
+  if ((meta.prestige || 0) >= 6){
+    const tw = narrow ? Math.min(280, W-48) : 280;
+    const th = 30;
+    const tx = CX - tw/2;
+    const ty = by + 14;
+    const cur = meta.preferredMode || 30;
+    const hov = mx>=tx && mx<=tx+tw && my>=ty && my<=ty+th;
+    const pulse = 0.6 + 0.4 * Math.sin(game.t * 1.4);
+    ctx.fillStyle = hov ? `rgba(250,204,21,${0.10 + 0.06*pulse})` : `rgba(250,204,21,${0.05})`;
+    roundRect(tx, ty, tw, th, 4);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(250,204,21,${hov ? pulse : 0.4 + 0.2*pulse})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(232,235,242,0.55)';
+    ctx.font = '300 9px "IBM Plex Mono",monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('MODE', tx + 14, ty + 19);
+    ctx.fillStyle = '#facc15';
+    ctx.font = '500 11px "IBM Plex Mono",monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(modeLabel(cur), CX, ty + 19);
+    ctx.fillStyle = `rgba(250,204,21,${0.5 + 0.4*pulse})`;
+    ctx.font = '300 italic 14px "Fraunces",serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('›', tx + tw - 14, ty + 21);
+    game.buttonHits.push({x:tx, y:ty, w:tw, h:th, action:cycleMode});
+    by = ty + th;
+  }
+
+  // ascension-available banner — first-time prestige unlock cue. Tappable, opens shop.
+  // Auto-dismisses once ascended (canAscend gates on prestige still being 0).
+  if (canAscend() && (meta.prestige || 0) === 0){
+    const bannerY = by + 16;
+    const bannerW = narrow ? Math.min(280, W-48) : 360;
+    const bannerH = 30;
+    const bx = CX - bannerW/2;
+    const pulse = 0.55 + 0.25 * Math.sin(game.t * 2.4);
+    ctx.fillStyle = `rgba(250,204,21,${0.08 + 0.05*pulse})`;
+    roundRect(bx, bannerY, bannerW, bannerH, 4);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(250,204,21,${pulse})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = `rgba(250,204,21,${0.7 + 0.3*pulse})`;
+    ctx.font = '500 11px "IBM Plex Mono",monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('▲  ASCENSION  AVAILABLE  ·  visit  shop', CX, bannerY + 19);
+    game.buttonHits.push({x:bx, y:bannerY, w:bannerW, h:bannerH, action:openShop});
+  }
+
+  // loadout — three slots showing equipped passives
+  if (showLoadout){
+    drawLoadout(by + 28, narrow);
+  }
+
+  // best time / hint at the bottom
+  const bottomY = showLoadout ? by + 130 : by + 60;
+  if (meta.bestTime > 0){
+    ctx.fillStyle = 'rgba(232,235,242,0.4)';
+    ctx.font = '300 11px "IBM Plex Mono",monospace';
+    ctx.fillText('best  descent  ·  ' + meta.bestTime.toFixed(1) + 's   over  ' + meta.runs + '  runs', CX, bottomY);
+  } else {
+    ctx.fillStyle = 'rgba(232,235,242,0.4)';
+    ctx.font = '300 11px "IBM Plex Mono",monospace';
+    ctx.fillText('survive  ·  thirty  ·  seconds', CX, bottomY);
+  }
+
+  ctx.fillStyle = 'rgba(232,235,242,0.3)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('keys · WASD · arrows  /  touch + drag', CX, H - 30);
+
+  // gear icon (top-right) — opens settings
+  drawGearIcon();
+
+  // overlays — picker and settings (settings drawn after picker so it can stack)
+  if (shopUI.pickerOpen) drawSlotPicker(narrow);
+  if (shopUI.settingsOpen) drawSettings(narrow);
+}
+
+function drawLoadout(baseY, narrow){
+  // header
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232,235,242,0.45)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('— LOADOUT —', CX, baseY);
+
+  const slotW = narrow ? 90 : 110;
+  const slotH = 56;
+  const gap = 10;
+  const totalW = slotW*MAX_SLOTS + gap*(MAX_SLOTS-1);
+  const startX = CX - totalW/2;
+  const slotY = baseY + 14;
+
+  const equipped = meta.equipped || [];
+  for (let i=0;i<MAX_SLOTS;i++){
+    const x = startX + i*(slotW+gap);
+    const id = equipped[i];
+    const passive = id ? PASSIVE_BY_ID[id] : null;
+    const hov = mx>=x && mx<=x+slotW && my>=slotY && my<=slotY+slotH;
+
+    if (passive){
+      // filled slot
+      ctx.fillStyle = hov ? 'rgba(94,233,255,0.16)' : 'rgba(94,233,255,0.06)';
+      ctx.strokeStyle = hov ? '#5ee9ff' : 'rgba(94,233,255,0.5)';
+      ctx.lineWidth = 1.2;
+    } else {
+      ctx.fillStyle = hov ? 'rgba(232,235,242,0.05)' : 'rgba(15,20,35,0.5)';
+      ctx.strokeStyle = hov ? 'rgba(232,235,242,0.4)' : 'rgba(232,235,242,0.18)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4,4]);
+    }
+    roundRect(x, slotY, slotW, slotH, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (passive){
+      // symbol top
+      ctx.fillStyle = '#5ee9ff';
+      ctx.font = '300 22px "Fraunces",serif';
+      ctx.fillText(passive.symbol, x + slotW/2, slotY + 26);
+      // title
+      ctx.fillStyle = '#e8ebf2';
+      ctx.font = '500 9px "IBM Plex Mono",monospace';
+      ctx.fillText(passive.title, x + slotW/2, slotY + 44);
+    } else {
+      ctx.fillStyle = 'rgba(232,235,242,0.3)';
+      ctx.font = '300 10px "IBM Plex Mono",monospace';
+      ctx.fillText('empty', x + slotW/2, slotY + slotH/2 + 4);
+    }
+
+    game.buttonHits.push({x, y:slotY, w:slotW, h:slotH, action:()=>openSlotPicker(i)});
+  }
+}
+
+function openSlotPicker(slot){
+  shopUI.pickerOpen = true;
+  shopUI.pickerSlot = slot;
+  shopUI.pickerScroll = 0;
+}
+function closeSlotPicker(){
+  shopUI.pickerOpen = false;
+  shopUI.pickerSlot = -1;
+}
+
+function drawSlotPicker(narrow){
+  // dim everything
+  ctx.fillStyle = 'rgba(6,8,16,0.85)';
+  ctx.fillRect(0,0,W,H);
+
+  // clear other hit areas to prevent click-through to background
+  game.buttonHits.length = 0;
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232,235,242,0.55)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('— SLOT  ' + (shopUI.pickerSlot+1) + '  /  ' + MAX_SLOTS + ' —', CX, narrow ? 50 : 80);
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = `300 italic ${narrow ? 28 : 36}px "Fraunces",serif`;
+  ctx.fillText('Choose passive.', CX, narrow ? 86 : 122);
+
+  const rowH = narrow ? 50 : 56;
+  const rowGap = 8;
+  const rowW = Math.min(360, W - 48);
+  const rowX = CX - rowW/2;
+
+  const equipped = meta.equipped || [];
+  const currentId = equipped[shopUI.pickerSlot];
+
+  // build list of rows to draw
+  const rows = [];
+  if (currentId){
+    rows.push({ kind:'unequip' });
+  }
+  for (const p of PASSIVES){
+    rows.push({ kind:'passive', passive: p });
+  }
+
+  // scroll bounds
+  const headerEnd = narrow ? 110 : 150;
+  const closeY = H - 70;
+  const areaTop = headerEnd;
+  const areaBottom = closeY - 14;
+  const areaH = Math.max(80, areaBottom - areaTop);
+  const contentH = rows.length * (rowH + rowGap) - rowGap;
+  shopUI.pickerMaxScroll = Math.max(0, contentH - areaH);
+  shopUI.pickerScroll = clamp(shopUI.pickerScroll, 0, shopUI.pickerMaxScroll);
+
+  // clip rows area
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, areaTop, W, areaH);
+  ctx.clip();
+
+  let y = areaTop + 4 - shopUI.pickerScroll;
+  for (const r of rows){
+    if (r.kind === 'unequip'){
+      drawPickerRow(rowX, y, rowW, rowH, null, true, ()=>{
+        unequipSlot(shopUI.pickerSlot);
+        closeSlotPicker();
+      }, false, false, areaTop, areaBottom);
+    } else {
+      const p = r.passive;
+      const lvl = passiveLevel(p.id);
+      const owned = lvl > 0;
+      const isCurrent = currentId === p.id;
+      const equippedElsewhere = !isCurrent && equipped.includes(p.id);
+      drawPickerRow(rowX, y, rowW, rowH, p, owned, ()=>{
+        if (!owned) return;
+        equipInSlot(shopUI.pickerSlot, p.id);
+        closeSlotPicker();
+      }, isCurrent, equippedElsewhere, areaTop, areaBottom);
+    }
+    y += rowH + rowGap;
+  }
+
+  ctx.restore();
+
+  // top/bottom fade hint when content overflows
+  if (shopUI.pickerMaxScroll > 0){
+    if (shopUI.pickerScroll > 2){
+      const grd = ctx.createLinearGradient(0, areaTop, 0, areaTop + 24);
+      grd.addColorStop(0, 'rgba(6,8,16,0.85)');
+      grd.addColorStop(1, 'rgba(6,8,16,0)');
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, areaTop, W, 24);
+    }
+    if (shopUI.pickerScroll < shopUI.pickerMaxScroll - 2){
+      const grd = ctx.createLinearGradient(0, areaBottom - 24, 0, areaBottom);
+      grd.addColorStop(0, 'rgba(6,8,16,0)');
+      grd.addColorStop(1, 'rgba(6,8,16,0.85)');
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, areaBottom - 24, W, 24);
+    }
+    const trackH = areaH - 16;
+    const thumbH = Math.max(28, trackH * (areaH / contentH));
+    const thumbY = areaTop + 8 + (trackH - thumbH) * (shopUI.pickerScroll / shopUI.pickerMaxScroll);
+    ctx.fillStyle = 'rgba(232,235,242,0.08)';
+    ctx.fillRect(W - 7, areaTop + 8, 2, trackH);
+    ctx.fillStyle = 'rgba(94,233,255,0.55)';
+    ctx.fillRect(W - 7, thumbY, 2, thumbH);
+  }
+
+  // close button
+  const closeW = 200, closeH = 40;
+  drawButton(CX-closeW/2, closeY, closeW, closeH, 'CLOSE', closeSlotPicker, false);
+}
+
+function drawPickerRow(x, y, w, h, passive, enabled, action, isCurrent, equippedElsewhere, areaTop, areaBottom){
+  const hov = enabled && mx>=x && mx<=x+w && my>=y && my<=y+h;
+
+  if (isCurrent){
+    ctx.fillStyle = 'rgba(94,233,255,0.14)';
+    ctx.strokeStyle = '#5ee9ff';
+  } else if (hov){
+    ctx.fillStyle = 'rgba(94,233,255,0.08)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.6)';
+  } else if (enabled){
+    ctx.fillStyle = 'rgba(15,20,35,0.85)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.25)';
+  } else {
+    ctx.fillStyle = 'rgba(15,20,35,0.4)';
+    ctx.strokeStyle = 'rgba(232,235,242,0.1)';
+  }
+  ctx.lineWidth = (isCurrent || hov) ? 1.4 : 1;
+  roundRect(x, y, w, h, 3);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  if (!passive){
+    // unequip row
+    ctx.fillStyle = 'rgba(255,107,138,0.7)';
+    ctx.font = '300 18px "Fraunces",serif';
+    ctx.fillText('×', x + 18, y + 35);
+    ctx.fillStyle = '#e8ebf2';
+    ctx.font = '500 12px "IBM Plex Mono",monospace';
+    ctx.fillText('UNEQUIP', x + 42, y + 24);
+    ctx.fillStyle = 'rgba(232,235,242,0.5)';
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    ctx.fillText('clear this slot', x + 42, y + 40);
+  } else {
+    const lvl = passiveLevel(passive.id);
+    const owned = lvl > 0;
+    ctx.fillStyle = owned ? '#5ee9ff' : 'rgba(232,235,242,0.25)';
+    ctx.font = '300 22px "Fraunces",serif';
+    ctx.fillText(passive.symbol, x + 18, y + 36);
+
+    ctx.fillStyle = owned ? '#e8ebf2' : 'rgba(232,235,242,0.3)';
+    ctx.font = '500 12px "IBM Plex Mono",monospace';
+    ctx.fillText(passive.title, x + 50, y + 22);
+
+    ctx.fillStyle = owned ? 'rgba(232,235,242,0.6)' : 'rgba(232,235,242,0.25)';
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    if (owned){
+      ctx.fillText(passive.desc(lvl), x + 50, y + 40);
+    } else {
+      ctx.fillText('not yet acquired', x + 50, y + 40);
+    }
+
+    // status tag right side
+    ctx.textAlign = 'right';
+    if (isCurrent){
+      ctx.fillStyle = '#5ee9ff';
+      ctx.font = '500 9px "IBM Plex Mono",monospace';
+      ctx.fillText('EQUIPPED', x + w - 16, y + 22);
+    } else if (equippedElsewhere){
+      ctx.fillStyle = 'rgba(255,210,74,0.7)';
+      ctx.font = '500 9px "IBM Plex Mono",monospace';
+      ctx.fillText('SWAP', x + w - 16, y + 22);
+    }
+    // level pips
+    if (owned){
+      ctx.textAlign = 'right';
+      const max = passive.costs.length;
+      const pipR = 3, pipG = 5;
+      const pipsW = max*pipR*2 + (max-1)*pipG;
+      let px = x + w - 16 - pipsW + pipR;
+      const py = y + 40;
+      for (let i=0;i<max;i++){
+        const filled = i < lvl;
+        ctx.fillStyle = filled ? '#5ee9ff' : 'rgba(232,235,242,0.18)';
+        ctx.beginPath();
+        ctx.arc(px, py, pipR, 0, TAU);
+        ctx.fill();
+        px += pipR*2 + pipG;
+      }
+    }
+    ctx.textAlign = 'left';
+  }
+
+  if (enabled){
+    const top = areaTop !== undefined ? Math.max(y, areaTop) : y;
+    const bot = areaBottom !== undefined ? Math.min(y+h, areaBottom) : (y+h);
+    const visH = bot - top;
+    if (visH >= 24){
+      game.buttonHits.push({x, y:top, w, h:visH, action});
+    }
+  }
+}
+
+// ===== settings overlay =====
+function drawSettings(narrow){
+  // dim background
+  ctx.fillStyle = 'rgba(6,8,16,0.88)';
+  ctx.fillRect(0,0,W,H);
+  // wipe button hits — only settings interactions count
+  game.buttonHits.length = 0;
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232,235,242,0.55)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('— SETTINGS —', CX, narrow ? 50 : 80);
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = `300 italic ${narrow ? 32 : 44}px "Fraunces",serif`;
+  ctx.fillText('Settings.', CX, narrow ? 92 : 132);
+
+  // Section: CONTROLS
+  const panelW = Math.min(380, W - 36);
+  const panelX = CX - panelW/2;
+  let panelY = narrow ? 130 : 180;
+  panelY = drawSettingsSection(panelX, panelY, panelW, 'CONTROLS', (x, y, w) => {
+    return drawGyroRow(x, y, w, narrow);
+  }, narrow);
+
+  // Section: DATA (reset)
+  panelY += 16;
+  panelY = drawSettingsSection(panelX, panelY, panelW, 'DATA', (x, y, w) => {
+    return drawResetRow(x, y, w, narrow);
+  }, narrow);
+
+  // Close button at bottom
+  const closeW = narrow ? Math.min(280, W-48) : 220;
+  const closeY = H - 70;
+  drawButton(CX - closeW/2, closeY, closeW, 44, 'CLOSE', closeSettings, false);
+
+  if (game.shopMsgTimer > 0){
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(94,233,255,${clamp(game.shopMsgTimer,0,1)})`;
+    ctx.font = '300 12px "IBM Plex Mono",monospace';
+    ctx.fillText(game.shopMsg, CX, closeY - 18);
+  }
+}
+
+// renders a labeled section frame, calls inner() to draw the contents,
+// returns the y where the section ended
+function drawSettingsSection(x, y, w, label, inner, narrow){
+  // label
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(94,233,255,0.55)';
+  ctx.font = '500 9px "IBM Plex Mono",monospace';
+  ctx.fillText(label, x + 4, y);
+  // inner content area
+  const contentY = y + 8;
+  const innerH = inner(x, contentY, w);
+  // light divider at the bottom
+  const endY = contentY + innerH;
+  ctx.strokeStyle = 'rgba(232,235,242,0.08)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, endY + 6);
+  ctx.lineTo(x + w, endY + 6);
+  ctx.stroke();
+  return endY + 6;
+}
+
+function drawGyroRow(x, y, w, narrow){
+  const rowH = narrow ? 60 : 64;
+  const enabled = !!meta.gyroEnabled;
+  const supported = gyro.available;
+
+  // background card
+  ctx.fillStyle = 'rgba(15,20,35,0.4)';
+  ctx.strokeStyle = 'rgba(232,235,242,0.10)';
+  ctx.lineWidth = 1;
+  roundRect(x, y, w, rowH, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  // title
+  ctx.textAlign = 'left';
+  ctx.fillStyle = supported ? '#e8ebf2' : 'rgba(232,235,242,0.4)';
+  ctx.font = '500 12px "IBM Plex Mono",monospace';
+  ctx.fillText('Gyroscopic movement', x + 14, y + 22);
+
+  // status / live readout
+  ctx.fillStyle = supported ? 'rgba(232,235,242,0.55)' : 'rgba(232,235,242,0.3)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  let subText;
+  if (!supported){
+    subText = 'not supported on this device';
+  } else if (gyro.permission === 'denied'){
+    subText = 'permission denied · check browser settings';
+  } else if (enabled){
+    if (gyro.eventCount > 0){
+      // live values — proves the listener is firing
+      const b = gyro.raw.beta.toFixed(0);
+      const g = gyro.raw.gamma.toFixed(0);
+      ctx.fillStyle = '#5ee9ff';
+      subText = 'live · β ' + b + '° · γ ' + g + '°';
+    } else {
+      ctx.fillStyle = 'rgba(255,210,74,0.85)';
+      subText = 'enabled but receiving no data · try moving the device';
+    }
+  } else {
+    subText = 'tilt the device to move';
+  }
+  ctx.fillText(subText, x + 14, y + 42);
+
+  // toggle pill on the right
+  const tw = 50, th = 26;
+  const tx = x + w - 14 - tw;
+  const ty = y + (rowH - th)/2;
+  const interactive = supported && gyro.permission !== 'denied';
+  const hov = interactive && mx>=tx && mx<=tx+tw && my>=ty && my<=ty+th;
+
+  if (enabled){
+    ctx.fillStyle = hov ? 'rgba(94,233,255,0.32)' : 'rgba(94,233,255,0.22)';
+    ctx.strokeStyle = '#5ee9ff';
+  } else if (interactive){
+    ctx.fillStyle = hov ? 'rgba(232,235,242,0.08)' : 'rgba(15,20,35,0.6)';
+    ctx.strokeStyle = hov ? 'rgba(232,235,242,0.5)' : 'rgba(232,235,242,0.25)';
+  } else {
+    ctx.fillStyle = 'rgba(15,20,35,0.4)';
+    ctx.strokeStyle = 'rgba(232,235,242,0.12)';
+  }
+  ctx.lineWidth = 1.2;
+  roundRect(tx, ty, tw, th, th/2);
+  ctx.fill();
+  ctx.stroke();
+
+  // knob inside pill
+  const knobR = th/2 - 4;
+  const knobX = enabled ? (tx + tw - knobR - 4) : (tx + knobR + 4);
+  ctx.fillStyle = enabled ? '#5ee9ff' : (interactive ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.3)');
+  ctx.beginPath();
+  ctx.arc(knobX, ty + th/2, knobR, 0, TAU);
+  ctx.fill();
+
+  if (interactive){
+    game.buttonHits.push({ x:tx, y:ty, w:tw, h:th, action:()=>{
+      if (enabled) disableGyro();
+      else enableGyro();
+    }});
+  }
+  return rowH;
+}
+
+function drawResetRow(x, y, w, narrow){
+  const rowH = narrow ? 60 : 64;
+  ctx.fillStyle = 'rgba(15,20,35,0.4)';
+  ctx.strokeStyle = 'rgba(232,235,242,0.10)';
+  ctx.lineWidth = 1;
+  roundRect(x, y, w, rowH, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = '500 12px "IBM Plex Mono",monospace';
+  ctx.fillText('Reset progression', x + 14, y + 22);
+  ctx.fillStyle = 'rgba(232,235,242,0.55)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('wipes all upgrades, score, and essence', x + 14, y + 42);
+
+  // button on the right — uses the existing 2-tap confirm flow
+  const bw = 110, bh = 32;
+  const bx = x + w - 14 - bw;
+  const by = y + (rowH - bh)/2;
+  const hov = mx>=bx && mx<=bx+bw && my>=by && my<=by+bh;
+
+  if (game.resetState === 1){
+    const pulse = 0.55 + 0.45*Math.sin(game.t*7);
+    ctx.fillStyle = `rgba(255,107,138,${0.10 + 0.16*pulse})`;
+    ctx.strokeStyle = `rgba(255,107,138,${0.6 + 0.4*pulse})`;
+    ctx.lineWidth = 1.2;
+    roundRect(bx, by, bw, bh, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = `rgba(255,107,138,${0.85 + 0.15*pulse})`;
+    ctx.font = '500 10px "IBM Plex Mono",monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('CONFIRM ' + Math.ceil(game.resetTimer), bx + bw/2, by + bh/2 + 4);
+  } else {
+    ctx.fillStyle = hov ? 'rgba(255,107,138,0.10)' : 'rgba(15,20,35,0.6)';
+    ctx.strokeStyle = hov ? 'rgba(255,107,138,0.7)' : 'rgba(255,107,138,0.4)';
+    ctx.lineWidth = 1;
+    roundRect(bx, by, bw, bh, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = hov ? '#ff6b8a' : 'rgba(255,107,138,0.85)';
+    ctx.font = '500 10px "IBM Plex Mono",monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('RESET', bx + bw/2, by + bh/2 + 4);
+  }
+  game.buttonHits.push({ x:bx, y:by, w:bw, h:bh, action:tryReset });
+  return rowH;
+}
+
+// gear icon shown top-right of the menu and shop
+function drawGearIcon(){
+  const size = 28;
+  const x = W - 14 - size;
+  const y = 14;
+  const cx = x + size/2;
+  const cy = y + size/2;
+  const hov = mx>=x && mx<=x+size && my>=y && my<=y+size;
+
+  ctx.strokeStyle = hov ? 'rgba(232,235,242,0.85)' : 'rgba(232,235,242,0.45)';
+  ctx.fillStyle = hov ? 'rgba(232,235,242,0.06)' : 'rgba(15,20,35,0.4)';
+  ctx.lineWidth = 1;
+  roundRect(x, y, size, size, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  // simple gear glyph: 8 teeth
+  ctx.strokeStyle = hov ? '#e8ebf2' : 'rgba(232,235,242,0.7)';
+  ctx.lineWidth = 1.4;
+  const teeth = 8;
+  const inner = 5;
+  const outer = 8;
+  ctx.beginPath();
+  for (let i = 0; i < teeth; i++){
+    const a1 = (i / teeth) * TAU;
+    const a2 = ((i + 0.5) / teeth) * TAU;
+    const a3 = ((i + 1) / teeth) * TAU;
+    ctx.lineTo(cx + Math.cos(a1) * outer, cy + Math.sin(a1) * outer);
+    ctx.lineTo(cx + Math.cos(a2) * inner, cy + Math.sin(a2) * inner);
+    ctx.lineTo(cx + Math.cos(a3) * outer, cy + Math.sin(a3) * outer);
+  }
+  ctx.closePath();
+  ctx.stroke();
+  // inner circle
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2.2, 0, TAU);
+  ctx.stroke();
+
+  game.buttonHits.push({ x, y, w:size, h:size, action:openSettings });
+}
+
+function drawButton(x, y, w, h, label, action, primary){
+  const hov = mx>=x && mx<=x+w && my>=y && my<=y+h;
+  ctx.lineWidth = hov ? 1.5 : 1;
+  if (primary){
+    ctx.fillStyle = hov ? 'rgba(94,233,255,0.18)' : 'rgba(94,233,255,0.08)';
+    ctx.strokeStyle = '#5ee9ff';
+    if (hov){ ctx.shadowColor = '#5ee9ff'; ctx.shadowBlur = 16; }
+  } else {
+    ctx.fillStyle = hov ? 'rgba(232,235,242,0.06)' : 'rgba(232,235,242,0.02)';
+    ctx.strokeStyle = hov ? 'rgba(232,235,242,0.5)' : 'rgba(232,235,242,0.25)';
+  }
+  roundRect(x, y, w, h, 4);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = primary ? '#fff' : (hov ? '#e8ebf2' : 'rgba(232,235,242,0.7)');
+  ctx.font = '500 13px "IBM Plex Mono",monospace';
+  ctx.fillText(label, x+w/2, y+h/2+1);
+  ctx.textBaseline = 'alphabetic';
+  game.buttonHits.push({x,y,w,h,action});
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function drawShop(){
+  ctx.fillStyle = 'rgba(6,8,16,0.65)';
+  ctx.fillRect(0,0,W,H);
+
+  const narrow = W < 720;
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('— THE  ARCHITECT —', CX, narrow ? 32 : 50);
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = `300 italic ${narrow ? 28 : 44}px "Fraunces",serif`;
+  ctx.fillText('Spend or descend.', CX, narrow ? 60 : 92);
+
+  // currency line — show both
+  ctx.fillStyle = '#5ee9ff';
+  ctx.font = `300 italic ${narrow ? 14 : 17}px "Fraunces",serif`;
+  ctx.fillText(formatScore(meta.totalScore) + ' score · ' + (meta.totalEssence||0) + ' essence', CX, narrow ? 80 : 118);
+
+  // tab bar
+  const tabY = narrow ? 96 : 140;
+  drawShopTabs(tabY, narrow);
+
+  // gear icon (top-right) — opens settings, which contains reset
+  drawGearIcon();
+
+  // grid layout
+  const cols = narrow ? 2 : 3;
+  const items = shopUI.tab === 'passives' ? PASSIVES : META_UPGRADES;
+  const includeAscend = shopUI.tab === 'stats';  // ASCEND card pinned to bottom of stats grid
+  const totalItems = items.length + (includeAscend ? 1 : 0);
+  const rows = Math.ceil(totalItems / cols);
+  const gx = narrow ? 12 : 24;
+  const gy = narrow ? 12 : 24;
+  const maxCardW = narrow ? 180 : 220;
+  const cardW = Math.min(maxCardW, (W - 32 - (cols-1)*gx) / cols);
+  const cardH = narrow ? 138 : 164;
+  const totalW = cols*cardW + (cols-1)*gx;
+
+  const headerEnd = tabY + 30;
+  const backY = H - 70;
+  const cardsAreaTop = headerEnd;
+  const cardsAreaBottom = backY - 18;
+  const cardsAreaH = Math.max(80, cardsAreaBottom - cardsAreaTop);
+  const contentH = rows*cardH + (rows-1)*gy + 16;
+  shopUI.maxScroll = Math.max(0, contentH - cardsAreaH);
+  shopUI.scroll = clamp(shopUI.scroll, 0, shopUI.maxScroll);
+
+  const startX = CX - totalW/2;
+  const startY = cardsAreaTop + 8 - shopUI.scroll;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, cardsAreaTop, W, cardsAreaH);
+  ctx.clip();
+
+  if (shopUI.tab === 'passives'){
+    for (let i=0;i<PASSIVES.length;i++){
+      const p = PASSIVES[i];
+      const col = i%cols, row = Math.floor(i/cols);
+      const x = startX + col*(cardW+gx);
+      const y = startY + row*(cardH+gy);
+      drawPassiveCard(x, y, cardW, cardH, p, cardsAreaTop, cardsAreaBottom);
+    }
+  } else {
+    for (let i=0;i<META_UPGRADES.length;i++){
+      const u = META_UPGRADES[i];
+      const col = i%cols, row = Math.floor(i/cols);
+      const x = startX + col*(cardW+gx);
+      const y = startY + row*(cardH+gy);
+      drawShopCard(x, y, cardW, cardH, u, cardsAreaTop, cardsAreaBottom);
+    }
+    // ASCEND card — pinned at the bottom of the stats grid
+    const ai = META_UPGRADES.length;
+    const acol = ai%cols, arow = Math.floor(ai/cols);
+    const ax = startX + acol*(cardW+gx);
+    const ay = startY + arow*(cardH+gy);
+    drawAscendCard(ax, ay, cardW, cardH, cardsAreaTop, cardsAreaBottom);
+  }
+
+  ctx.restore();
+
+  // top/bottom fade hint when content overflows
+  if (shopUI.maxScroll > 0){
+    if (shopUI.scroll > 2){
+      const grd = ctx.createLinearGradient(0, cardsAreaTop, 0, cardsAreaTop + 24);
+      grd.addColorStop(0, 'rgba(6,8,16,0.85)');
+      grd.addColorStop(1, 'rgba(6,8,16,0)');
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, cardsAreaTop, W, 24);
+    }
+    if (shopUI.scroll < shopUI.maxScroll - 2){
+      const grd = ctx.createLinearGradient(0, cardsAreaBottom - 24, 0, cardsAreaBottom);
+      grd.addColorStop(0, 'rgba(6,8,16,0)');
+      grd.addColorStop(1, 'rgba(6,8,16,0.85)');
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, cardsAreaBottom - 24, W, 24);
+    }
+    const trackH = cardsAreaH - 16;
+    const thumbH = Math.max(28, trackH * (cardsAreaH / contentH));
+    const thumbY = cardsAreaTop + 8 + (trackH - thumbH) * (shopUI.scroll / shopUI.maxScroll);
+    ctx.fillStyle = 'rgba(232,235,242,0.08)';
+    ctx.fillRect(W - 7, cardsAreaTop + 8, 2, trackH);
+    ctx.fillStyle = 'rgba(94,233,255,0.55)';
+    ctx.fillRect(W - 7, thumbY, 2, thumbH);
+  }
+
+  const backW = narrow ? Math.min(280, W-48) : 240;
+  drawButton(CX - backW/2, backY, backW, 44, 'BACK  TO  MENU', ()=>{ game.scene='menu'; }, false);
+
+  if (game.shopMsgTimer > 0){
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(255,107,138,${clamp(game.shopMsgTimer,0,1)})`;
+    ctx.font = '300 12px "IBM Plex Mono",monospace';
+    ctx.fillText(game.shopMsg, CX, backY - 20);
+  }
+
+  if (shopUI.settingsOpen) drawSettings(narrow);
+  // ascend confirmation modal: render last so it's on top, and clear all underlying
+  // hit registrations so only modal buttons are interactive while it's up.
+  if (shopUI.ascendConfirm){
+    game.buttonHits = [];
+    drawAscendConfirm(narrow);
+  }
+}
+
+function drawAscendCard(x, y, w, h, areaTop, areaBottom){
+  const available = canAscend();
+  const tight = w < 200;
+  const padX = tight ? 12 : 18;
+  const symSize = tight ? 18 : 22;
+  const titleSize = tight ? 11 : 13;
+  const descSize = tight ? 10 : 11;
+  const lh = tight ? 12 : 14;
+
+  const hov = mx>=x && mx<=x+w && my>=y && my<=y+h;
+  const pulse = 0.6 + 0.4 * Math.sin(game.t * 1.6);
+
+  // gold-themed visuals to distinguish from cyan stat upgrades
+  if (available && hov){
+    ctx.fillStyle = `rgba(250,204,21,${0.10 + 0.06*pulse})`;
+    ctx.strokeStyle = '#facc15';
+    ctx.shadowColor = '#facc15';
+    ctx.shadowBlur = 18;
+  } else if (available){
+    ctx.fillStyle = 'rgba(40,30,8,0.78)';
+    ctx.strokeStyle = `rgba(250,204,21,${0.35 + 0.15*pulse})`;
+  } else {
+    ctx.fillStyle = 'rgba(15,20,35,0.5)';
+    ctx.strokeStyle = 'rgba(232,235,242,0.12)';
+  }
+  ctx.lineWidth = (available && hov) ? 1.5 : 1;
+  roundRect(x, y, w, h, 4);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = available ? '#facc15' : 'rgba(232,235,242,0.3)';
+  ctx.font = `300 ${symSize}px "Fraunces",serif`;
+  ctx.fillText('▲', x+padX, y + (tight ? 26 : 30));
+
+  ctx.fillStyle = available ? '#fff' : 'rgba(232,235,242,0.4)';
+  ctx.font = `500 ${titleSize}px "IBM Plex Mono",monospace`;
+  ctx.fillText('ASCEND', x + padX + (tight ? 22 : 26), y + (tight ? 24 : 28));
+
+  ctx.fillStyle = available ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.3)';
+  ctx.font = `300 ${descSize}px "IBM Plex Mono",monospace`;
+
+  const owned = totalStatLevels();
+  let descLines;
+  if (available){
+    const nextRank = (meta.prestige || 0) + 1;
+    const nextMult = prestigeCurve(nextRank);
+    const curMult = meta.prestigeMult || 1;
+    const gainPct = ((nextMult - curMult) * 100).toFixed(1);
+    descLines = [
+      'Reset stats. Keep passives.',
+      'Permanent score multiplier:',
+      curMult.toFixed(2) + 'x  →  ' + nextMult.toFixed(2) + 'x  (+' + gainPct + '%)',
+    ];
+  } else {
+    descLines = [
+      'First ascension unlocks at',
+      '12 stat levels owned.',
+      owned + ' / 12 levels owned',
+    ];
+  }
+  for (let i=0;i<descLines.length;i++){
+    ctx.fillText(descLines[i], x+padX, y + (tight ? 44 : 52) + i*lh);
+  }
+
+  // bottom-right: rank badge if available, progress bar if locked
+  ctx.textAlign = 'right';
+  if (available){
+    ctx.fillStyle = '#facc15';
+    ctx.font = `500 ${tight?12:13}px "IBM Plex Mono",monospace`;
+    ctx.fillText('▲ P' + ((meta.prestige || 0) + 1), x+w-padX, y+h-(tight?14:17));
+  } else {
+    const pct = clamp(owned / 12, 0, 1);
+    const barW = w - padX*2;
+    const barH = 3;
+    const barX = x + padX;
+    const barY = y + h - (tight ? 14 : 18);
+    ctx.fillStyle = 'rgba(232,235,242,0.12)';
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.fillStyle = '#facc15';
+    ctx.fillRect(barX, barY, barW * pct, barH);
+  }
+
+  if (available){
+    const top = areaTop !== undefined ? Math.max(y, areaTop) : y;
+    const bot = areaBottom !== undefined ? Math.min(y+h, areaBottom) : (y+h);
+    const visH = bot - top;
+    if (visH >= 28){
+      game.buttonHits.push({x, y:top, w, h:visH, action:()=>{
+        shopUI.ascendConfirm = true;
+      }});
+    }
+  }
+}
+
+function drawAscendConfirm(narrow){
+  // dim backdrop — block underlying interaction visually
+  ctx.fillStyle = 'rgba(6,8,16,0.88)';
+  ctx.fillRect(0, 0, W, H);
+
+  const panelW = narrow ? Math.min(W-32, 380) : 440;
+  const panelH = narrow ? 360 : 340;
+  const px = CX - panelW/2;
+  const py = CY - panelH/2;
+
+  ctx.fillStyle = 'rgba(15,20,35,0.97)';
+  ctx.strokeStyle = '#facc15';
+  ctx.lineWidth = 1;
+  ctx.shadowColor = '#facc15';
+  ctx.shadowBlur = 28;
+  roundRect(px, py, panelW, panelH, 6);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+
+  // title
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#facc15';
+  ctx.font = '300 italic 30px "Fraunces",serif';
+  ctx.fillText('ASCEND', CX, py + 46);
+
+  // divider
+  ctx.strokeStyle = 'rgba(250,204,21,0.3)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(px + 28, py + 64);
+  ctx.lineTo(px + panelW - 28, py + 64);
+  ctx.stroke();
+
+  const contentX = px + 32;
+  let cy = py + 90;
+  const lh = 17;
+  const sectionGap = 10;
+
+  ctx.textAlign = 'left';
+
+  // RESET section
+  ctx.fillStyle = 'rgba(255,107,138,0.9)';
+  ctx.font = '500 9px "IBM Plex Mono",monospace';
+  ctx.fillText('YOU  WILL  RESET', contentX, cy);
+  cy += 15;
+  ctx.fillStyle = 'rgba(232,235,242,0.85)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('·  Stat upgrades  (' + totalStatLevels() + '  levels)', contentX, cy);
+  cy += lh;
+  ctx.fillText('·  Banked score  (' + formatScore(meta.totalScore) + ')', contentX, cy);
+  cy += lh + sectionGap;
+
+  // KEEP section
+  ctx.fillStyle = 'rgba(94,233,255,0.9)';
+  ctx.font = '500 9px "IBM Plex Mono",monospace';
+  ctx.fillText('YOU  KEEP', contentX, cy);
+  cy += 15;
+  ctx.fillStyle = 'rgba(232,235,242,0.85)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('·  All passives  &  equipped slots', contentX, cy);
+  cy += lh;
+  ctx.fillText('·  Essence  (' + (meta.totalEssence||0) + ')', contentX, cy);
+  cy += lh + sectionGap;
+
+  // GAIN section
+  ctx.fillStyle = '#facc15';
+  ctx.font = '500 9px "IBM Plex Mono",monospace';
+  ctx.fillText('YOU  GAIN', contentX, cy);
+  cy += 15;
+  ctx.fillStyle = 'rgba(232,235,242,0.85)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  const newRank = (meta.prestige || 0) + 1;
+  const newMult = prestigeCurve(newRank);
+  ctx.fillText('·  Prestige Rank  ' + (meta.prestige || 0) + '  →  ' + newRank, contentX, cy);
+  cy += lh;
+  ctx.fillText('·  Score multiplier  ' + (meta.prestigeMult || 1).toFixed(2) + 'x  →  ' + newMult.toFixed(2) + 'x', contentX, cy);
+
+  // buttons
+  const bw = (panelW - 80) / 2;
+  const bh = 40;
+  const by = py + panelH - bh - 24;
+  drawButton(px + 28, by, bw, bh, 'CANCEL', ()=>{ shopUI.ascendConfirm = false; }, false);
+  drawButton(px + 28 + bw + 24, by, bw, bh, 'ASCEND', ascend, true);
+}
+
+function drawShopTabs(y, narrow){
+  const labels = [
+    { id:'stats', text:'STATS', currency:'score' },
+    { id:'passives', text:'PASSIVES', currency:'essence' },
+  ];
+  const tabW = narrow ? 130 : 160;
+  const gap = narrow ? 8 : 14;
+  const totalW = tabW * labels.length + gap * (labels.length-1);
+  const startX = CX - totalW/2;
+  for (let i=0;i<labels.length;i++){
+    const lab = labels[i];
+    const x = startX + i*(tabW + gap);
+    const active = shopUI.tab === lab.id;
+    ctx.lineWidth = active ? 1.4 : 1;
+    ctx.fillStyle = active ? 'rgba(94,233,255,0.10)' : 'rgba(232,235,242,0.02)';
+    ctx.strokeStyle = active ? '#5ee9ff' : 'rgba(232,235,242,0.20)';
+    roundRect(x, y, tabW, 28, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = active ? '#5ee9ff' : 'rgba(232,235,242,0.5)';
+    ctx.font = '500 11px "IBM Plex Mono",monospace';
+    ctx.fillText(lab.text, x + tabW/2, y + 15);
+    ctx.textBaseline = 'alphabetic';
+    if (!active){
+      game.buttonHits.push({ x, y, w:tabW, h:28, action:()=>{
+        shopUI.tab = lab.id;
+        shopUI.scroll = 0;
+      }});
+    }
+  }
+}
+
+function drawShopCard(x, y, w, h, u, areaTop, areaBottom){
+  const lvl = levelOf(u.id);
+  const max = u.costs.length;
+  const maxed = isMaxed(u);
+  const cost = nextCost(u);
+  const afford = canAfford(u);
+  const hov = mx>=x && mx<=x+w && my>=y && my<=y+h;
+  const interactive = !maxed && afford;
+  const tight = w < 200;
+
+  if (maxed){
+    ctx.fillStyle = 'rgba(94,233,255,0.05)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.4)';
+  } else if (interactive && hov){
+    ctx.fillStyle = 'rgba(94,233,255,0.12)';
+    ctx.strokeStyle = '#5ee9ff';
+    ctx.shadowColor = '#5ee9ff';
+    ctx.shadowBlur = 16;
+  } else if (interactive){
+    ctx.fillStyle = 'rgba(15,20,35,0.85)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.35)';
+  } else {
+    ctx.fillStyle = 'rgba(15,20,35,0.5)';
+    ctx.strokeStyle = 'rgba(232,235,242,0.12)';
+  }
+  ctx.lineWidth = (interactive && hov) ? 1.5 : 1;
+  roundRect(x, y, w, h, 4);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+
+  const padX = tight ? 12 : 18;
+  const symSize = tight ? 18 : 22;
+  const titleSize = tight ? 11 : 13;
+  const descSize = tight ? 10 : 11;
+  const lh = tight ? 12 : 14;
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = maxed ? '#5ee9ff' : (interactive ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.3)');
+  ctx.font = `300 ${symSize}px "Fraunces",serif`;
+  ctx.fillText(u.symbol, x+padX, y + (tight ? 26 : 30));
+
+  ctx.fillStyle = maxed ? '#fff' : (interactive ? '#e8ebf2' : 'rgba(232,235,242,0.4)');
+  ctx.font = `500 ${titleSize}px "IBM Plex Mono",monospace`;
+  ctx.fillText(u.title, x + padX + (tight ? 22 : 26), y + (tight ? 24 : 28));
+
+  ctx.fillStyle = interactive || maxed ? 'rgba(232,235,242,0.65)' : 'rgba(232,235,242,0.3)';
+  ctx.font = `300 ${descSize}px "IBM Plex Mono",monospace`;
+  wrapText(u.desc, x+padX, y + (tight ? 44 : 52), w - padX*2, lh);
+
+  const pipR = tight ? 3 : 4, pipG = tight ? 6 : 8;
+  let px = x+padX;
+  const py = y + h - (tight ? 18 : 22);
+  for (let i=0;i<max;i++){
+    const filled = i < lvl;
+    ctx.fillStyle = filled ? '#5ee9ff' : 'rgba(232,235,242,0.18)';
+    ctx.beginPath();
+    ctx.arc(px+pipR, py, pipR, 0, TAU);
+    ctx.fill();
+    px += pipR*2 + pipG;
+  }
+
+  ctx.textAlign = 'right';
+  if (maxed){
+    ctx.fillStyle = '#5ee9ff';
+    ctx.font = `500 ${tight?10:11}px "IBM Plex Mono",monospace`;
+    ctx.fillText('MAX', x+w-padX, y+h-(tight?15:18));
+  } else {
+    ctx.fillStyle = afford ? '#fff' : 'rgba(255,107,138,0.7)';
+    ctx.font = `500 ${tight?12:13}px "IBM Plex Mono",monospace`;
+    ctx.fillText('⊙ ' + cost, x+w-padX, y+h-(tight?14:17));
+  }
+
+  if (!maxed){
+    // only register a tap area for the visible portion of the card
+    const top = areaTop !== undefined ? Math.max(y, areaTop) : y;
+    const bot = areaBottom !== undefined ? Math.min(y+h, areaBottom) : (y+h);
+    const visH = bot - top;
+    if (visH >= 28){
+      game.buttonHits.push({x, y:top, w, h:visH, action:()=>{
+        if (afford){
+          buyUpgrade(u);
+          ringBurst(x+w/2, y+h/2, '#5ee9ff', 16);
+        } else {
+          game.shopMsg = 'Not enough score · need ' + (cost - meta.totalScore) + ' more';
+          game.shopMsgTimer = 2.0;
+        }
+      }});
+    }
+  }
+}
+
+function drawPassiveCard(x, y, w, h, p, areaTop, areaBottom){
+  const lvl = passiveLevel(p.id);
+  const max = p.costs.length;
+  const owned = lvl > 0;
+  const equipped = passiveEquipped(p.id);
+  const maxed = isPassiveMaxed(p);
+  const cost = nextPassiveCost(p);
+  const afford = canAffordPassive(p);
+  const hov = mx>=x && mx<=x+w && my>=y && my<=y+h;
+  const tight = w < 200;
+  const interactive = !maxed && afford;
+
+  if (maxed){
+    ctx.fillStyle = 'rgba(94,233,255,0.05)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.4)';
+  } else if (interactive && hov){
+    ctx.fillStyle = 'rgba(94,233,255,0.12)';
+    ctx.strokeStyle = '#5ee9ff';
+    ctx.shadowColor = '#5ee9ff';
+    ctx.shadowBlur = 16;
+  } else if (interactive){
+    ctx.fillStyle = 'rgba(15,20,35,0.85)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.35)';
+  } else {
+    ctx.fillStyle = 'rgba(15,20,35,0.5)';
+    ctx.strokeStyle = 'rgba(232,235,242,0.12)';
+  }
+  ctx.lineWidth = (interactive && hov) ? 1.5 : 1;
+  roundRect(x, y, w, h, 4);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+
+  const padX = tight ? 12 : 18;
+  const symSize = tight ? 18 : 22;
+  const titleSize = tight ? 11 : 13;
+  const descSize = tight ? 10 : 11;
+  const lh = tight ? 12 : 14;
+
+  // symbol
+  ctx.textAlign = 'left';
+  ctx.fillStyle = owned ? '#5ee9ff' : (interactive ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.3)');
+  ctx.font = `300 ${symSize}px "Fraunces",serif`;
+  ctx.fillText(p.symbol, x+padX, y + (tight ? 26 : 30));
+
+  // title
+  ctx.fillStyle = owned ? '#fff' : (interactive ? '#e8ebf2' : 'rgba(232,235,242,0.4)');
+  ctx.font = `500 ${titleSize}px "IBM Plex Mono",monospace`;
+  ctx.fillText(p.title, x + padX + (tight ? 22 : 26), y + (tight ? 24 : 28));
+
+  // EQUIPPED tag (top-right of card)
+  if (equipped){
+    const tagW = tight ? 56 : 66;
+    const tagH = 16;
+    const tagX = x + w - padX - tagW;
+    const tagY = y + (tight ? 14 : 16);
+    ctx.fillStyle = 'rgba(94,233,255,0.18)';
+    ctx.strokeStyle = 'rgba(94,233,255,0.6)';
+    ctx.lineWidth = 1;
+    roundRect(tagX, tagY, tagW, tagH, 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#5ee9ff';
+    ctx.font = '500 8px "IBM Plex Mono",monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('EQUIPPED', tagX + tagW/2, tagY + tagH/2 + 0.5);
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+  }
+
+  // short label (italic, one line)
+  ctx.fillStyle = (interactive || owned) ? 'rgba(232,235,242,0.55)' : 'rgba(232,235,242,0.3)';
+  ctx.font = `300 italic ${tight ? 9 : 10}px "Fraunces",serif`;
+  ctx.fillText(p.short, x+padX, y + (tight ? 42 : 50));
+
+  // separator
+  ctx.strokeStyle = 'rgba(94,233,255,0.12)';
+  ctx.lineWidth = 1;
+  const sepY = y + (tight ? 50 : 58);
+  ctx.beginPath();
+  ctx.moveTo(x+padX, sepY);
+  ctx.lineTo(x+w-padX, sepY);
+  ctx.stroke();
+
+  // level table
+  if (p.levels && p.levels.length > 0){
+    const tableSize = tight ? 9 : 10;
+    const rowH = tight ? 13 : 15;
+    const tableY = sepY + (tight ? 11 : 13);
+    const labelColW = tight ? 56 : 66;
+    const valueArea = w - padX*2 - labelColW;
+    const colW = valueArea / 3;
+
+    for (let r = 0; r < p.levels.length; r++){
+      const row = p.levels[r];
+      const rowY = tableY + r * rowH;
+
+      // label (left)
+      ctx.textAlign = 'left';
+      ctx.fillStyle = (interactive || owned) ? 'rgba(232,235,242,0.45)' : 'rgba(232,235,242,0.25)';
+      ctx.font = `300 ${tableSize}px "IBM Plex Mono",monospace`;
+      ctx.fillText(row.label, x+padX, rowY);
+
+      // values (one per level, center-aligned within their column)
+      ctx.textAlign = 'center';
+      for (let i = 0; i < row.values.length; i++){
+        const colCenterX = x + padX + labelColW + colW * (i + 0.5);
+        const isOwnedLevel = (i + 1) <= lvl;
+        const isNextLevel = !maxed && (i + 1) === lvl + 1;
+
+        if (isOwnedLevel){
+          // achieved levels — bright cyan
+          ctx.fillStyle = '#5ee9ff';
+          ctx.font = `500 ${tableSize}px "IBM Plex Mono",monospace`;
+        } else if (isNextLevel){
+          // next available — white bold
+          ctx.fillStyle = '#ffffff';
+          ctx.font = `500 ${tableSize}px "IBM Plex Mono",monospace`;
+        } else {
+          // future levels — dim
+          ctx.fillStyle = 'rgba(232,235,242,0.25)';
+          ctx.font = `300 ${tableSize}px "IBM Plex Mono",monospace`;
+        }
+        ctx.fillText(row.values[i], colCenterX, rowY);
+      }
+    }
+  }
+  ctx.textAlign = 'left';
+
+  // pip indicators
+  const pipR = tight ? 3 : 4, pipG = tight ? 6 : 8;
+  let px = x+padX;
+  const py = y + h - (tight ? 18 : 22);
+  for (let i=0;i<max;i++){
+    const filled = i < lvl;
+    ctx.fillStyle = filled ? '#5ee9ff' : 'rgba(232,235,242,0.18)';
+    ctx.beginPath();
+    ctx.arc(px+pipR, py, pipR, 0, TAU);
+    ctx.fill();
+    px += pipR*2 + pipG;
+  }
+
+  // cost / max indicator
+  ctx.textAlign = 'right';
+  if (maxed){
+    ctx.fillStyle = '#5ee9ff';
+    ctx.font = `500 ${tight?10:11}px "IBM Plex Mono",monospace`;
+    ctx.fillText('MAX', x+w-padX, y+h-(tight?15:18));
+  } else {
+    ctx.fillStyle = afford ? '#fff' : 'rgba(255,107,138,0.7)';
+    ctx.font = `500 ${tight?12:13}px "IBM Plex Mono",monospace`;
+    ctx.fillText('◊ ' + cost, x+w-padX, y+h-(tight?14:17));
+  }
+
+  // hit area: visible portion only
+  if (!maxed){
+    const top = areaTop !== undefined ? Math.max(y, areaTop) : y;
+    const bot = areaBottom !== undefined ? Math.min(y+h, areaBottom) : (y+h);
+    const visH = bot - top;
+    if (visH >= 28){
+      game.buttonHits.push({x, y:top, w, h:visH, action:()=>{
+        if (afford){
+          buyPassive(p);
+          ringBurst(x+w/2, y+h/2, '#5ee9ff', 16);
+        } else {
+          game.shopMsg = 'Not enough essence · need ' + (cost - (meta.totalEssence||0)) + ' more';
+          game.shopMsgTimer = 2.0;
+        }
+      }});
+    }
+  }
+}
+
+function wrapText(text, x, y, maxW, lh){
+  const words = text.split(' ');
+  let line = '';
+  let yy = y;
+  for (let i=0;i<words.length;i++){
+    const test = line + words[i] + ' ';
+    if (ctx.measureText(test).width > maxW && i > 0){
+      ctx.fillText(line.trim(), x, yy);
+      line = words[i] + ' ';
+      yy += lh;
+    } else line = test;
+  }
+  ctx.fillText(line.trim(), x, yy);
+}
+
+function drawModifierPick(){
+  ctx.fillStyle = 'rgba(6,8,16,0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  const narrow = W < 720;
+  ctx.textAlign = 'center';
+
+  // header
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('— THE  CHOICE —', CX, narrow ? 36 : 60);
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = `300 italic ${narrow ? 30 : 44}px "Fraunces",serif`;
+  ctx.fillText('Choose a modifier.', CX, narrow ? 70 : 110);
+  ctx.fillStyle = 'rgba(232,235,242,0.45)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('Each modifier reshapes the run and earns a score multiplier.', CX, narrow ? 92 : 138);
+
+  const picks = game.modifierPicks || [];
+  if (picks.length === 0){
+    // fallback — should be rare; auto-fill if somehow empty
+    rollModifierPicks();
+  }
+
+  // card layout
+  let cardW, cardH, gap, startX, startY;
+  if (narrow){
+    cardW = Math.min(W - 40, 320);
+    cardH = 86;
+    gap = 10;
+    startX = CX - cardW/2;
+    startY = 116;
+  } else {
+    cardW = Math.min(220, (W - 80) / 3);
+    cardH = 200;
+    gap = 22;
+    const totalW = cardW*3 + gap*2;
+    startX = CX - totalW/2;
+    startY = CY - cardH/2;
+  }
+
+  for (let i = 0; i < 3; i++){
+    const m = picks[i];
+    if (!m) continue;
+    const x = narrow ? startX : (startX + i*(cardW+gap));
+    const y = narrow ? (startY + i*(cardH+gap)) : startY;
+    drawModifierCard(x, y, cardW, cardH, m, i, narrow);
+  }
+
+  // DEFAULT button — descend without modifier
+  const defW = narrow ? Math.min(280, W-48) : 320;
+  const defH = 44;
+  const defY = narrow ? (startY + 3*(cardH+gap) + 8) : (startY + cardH + 28);
+  drawButton(CX - defW/2, defY, defW, defH, 'DESCEND  WITHOUT  MODIFIER', ()=>selectModifier(null), false);
+
+  // back to menu hint
+  ctx.fillStyle = 'rgba(232,235,242,0.3)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText(narrow ? 'tap a card to choose' : '1 2 3  pick  ·  SPACE  default  ·  ESC  back', CX, defY + defH + 22);
+}
+
+function drawModifierCard(x, y, w, h, m, idx, narrow){
+  const hov = mx>=x && mx<=x+w && my>=y && my<=y+h;
+  const pulse = 0.6 + 0.4 * Math.sin(game.t * 1.6 + idx * 0.5);
+
+  // gold theme to match the modifier system identity
+  if (hov){
+    ctx.fillStyle = `rgba(250,204,21,${0.10 + 0.06*pulse})`;
+    ctx.strokeStyle = '#facc15';
+    ctx.shadowColor = '#facc15';
+    ctx.shadowBlur = 18;
+  } else {
+    ctx.fillStyle = 'rgba(30,24,8,0.78)';
+    ctx.strokeStyle = `rgba(250,204,21,${0.30 + 0.10*pulse})`;
+  }
+  ctx.lineWidth = hov ? 1.5 : 1;
+  roundRect(x, y, w, h, 4);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.stroke();
+
+  const padX = narrow ? 14 : 18;
+
+  // index marker (1/2/3) — keyboard shortcut hint
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(250,204,21,0.55)';
+  ctx.font = '300 italic 14px "Fraunces",serif';
+  ctx.fillText(String(idx + 1), x + padX, y + (narrow ? 22 : 24));
+
+  // category label
+  ctx.fillStyle = 'rgba(232,235,242,0.4)';
+  ctx.font = '300 9px "IBM Plex Mono",monospace';
+  ctx.fillText(m.category, x + padX + 14, y + (narrow ? 20 : 22));
+
+  // title
+  ctx.fillStyle = '#facc15';
+  ctx.font = `500 ${narrow ? 13 : 15}px "IBM Plex Mono",monospace`;
+  ctx.fillText(m.title, x + padX, y + (narrow ? 40 : 50));
+
+  // description
+  ctx.fillStyle = 'rgba(232,235,242,0.78)';
+  ctx.font = `300 ${narrow ? 10 : 11}px "IBM Plex Mono",monospace`;
+  wrapText(m.desc, x + padX, y + (narrow ? 58 : 76), w - padX*2, narrow ? 13 : 14);
+
+  // score multiplier badge — bottom right
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#facc15';
+  ctx.font = `500 italic ${narrow ? 13 : 15}px "Fraunces",serif`;
+  ctx.fillText('×' + m.scoreMult.toFixed(2) + '  score', x + w - padX, y + h - (narrow ? 14 : 18));
+
+  // hit area
+  game.buttonHits.push({x, y, w, h, action:()=>selectModifier(m)});
+}
+
+function drawResult(){
+  const t = clamp(game.resultTimer / 0.6, 0, 1);
+  ctx.fillStyle = `rgba(6,8,16,${0.78*t})`;
+  ctx.fillRect(0,0,W,H);
+
+  ctx.globalAlpha = t;
+  ctx.textAlign = 'center';
+
+  const r = game.result;
+  const narrow = W < 540;
+
+  ctx.fillStyle = `rgba(${r.survived?'94,233,255':'255,107,138'},0.7)`;
+  ctx.font = '300 12px "IBM Plex Mono",monospace';
+  ctx.fillText(r.survived ? '— YOU  SURVIVED  THE  VOID —' : '— THE  VOID  CLAIMED  YOU —', CX, CY - 180);
+
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = '300 italic 76px "Fraunces",serif';
+  ctx.fillText(r.time.toFixed(1) + 's', CX, CY - 115);
+
+  ctx.strokeStyle = 'rgba(232,235,242,0.18)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(CX-100, CY-88); ctx.lineTo(CX+100, CY-88);
+  ctx.stroke();
+
+  // score collected
+  ctx.fillStyle = r.survived ? '#5ee9ff' : '#ff6b8a';
+  ctx.font = '300 italic 30px "Fraunces",serif';
+  ctx.fillText('+' + formatScore(r.gained), CX, CY - 52);
+  ctx.fillStyle = 'rgba(232,235,242,0.55)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('SCORE  COLLECTED', CX, CY - 34);
+  // multiplier breakdown — show prestige / modifier / mode math when any is active
+  const showPrestige = (meta.prestige || 0) > 0 && r.prestigeMult && r.baseGained !== undefined;
+  const showModifier = r.modifier && r.modifierMult && r.modifierMult !== 1;
+  const showMode = r.modeMult && r.modeMult !== 1;
+  if (showPrestige || showModifier || showMode){
+    let breakdown = formatScore(r.baseGained);
+    if (showModifier) breakdown += '  ×  ' + r.modifier.title.replace(/\s+/g,' ') + '  (' + r.modifierMult.toFixed(2) + 'x)';
+    if (showMode) breakdown += '  ×  ' + (r.runDuration||30) + 's  (' + r.modeMult.toFixed(2) + 'x)';
+    if (showPrestige) breakdown += '  ×  P' + meta.prestige + '  (' + r.prestigeMult.toFixed(2) + 'x)';
+    ctx.fillStyle = 'rgba(250,204,21,0.85)';
+    ctx.font = '300 italic 11px "Fraunces",serif';
+    ctx.fillText(breakdown, CX, CY - 18);
+  }
+
+  // essence + close-calls
+  const stats = [];
+  if (r.essence > 0) stats.push({ label:'ESSENCE', value:'+' + r.essence, color:'#5ee9ff' });
+  if (r.nearMisses > 0) stats.push({ label:'CLOSE CALLS', value:String(r.nearMisses), color:'rgba(94,233,255,0.7)' });
+  if (stats.length > 0){
+    const colW = 130;
+    const startX = CX - (stats.length-1)*colW/2;
+    for (let i=0;i<stats.length;i++){
+      const s = stats[i];
+      const x = startX + i*colW;
+      ctx.fillStyle = s.color;
+      ctx.font = '300 italic 18px "Fraunces",serif';
+      ctx.fillText(s.value, x, CY - 6);
+      ctx.fillStyle = 'rgba(232,235,242,0.4)';
+      ctx.font = '300 9px "IBM Plex Mono",monospace';
+      ctx.fillText(s.label, x, CY + 10);
+    }
+  }
+
+  ctx.fillStyle = 'rgba(232,235,242,0.45)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText(formatScore(meta.totalScore) + ' score · ' + (meta.totalEssence||0) + ' essence banked', CX, CY + 30);
+
+  // orb key (always shown, with breathing room above)
+  drawOrbKey(CY + 78, narrow);
+
+  // buttons
+  if (narrow){
+    const bw = Math.min(280, W-48), bh = 44;
+    const by = CY + 188;
+    drawButton(CX-bw/2, by, bw, bh, 'DESCEND  AGAIN', beginRun, true);
+    drawButton(CX-bw/2, by + bh + 10, bw, bh, 'UPGRADES', openShop, false);
+  } else {
+    const bw = 180, bh = 44, gap = 16;
+    const totalW = bw*2 + gap;
+    const baseX = CX - totalW/2;
+    const by = CY + 188;
+    drawButton(baseX, by, bw, bh, 'DESCEND  AGAIN', beginRun, true);
+    drawButton(baseX+bw+gap, by, bw, bh, 'UPGRADES', openShop, false);
+  }
+
+  ctx.fillStyle = 'rgba(232,235,242,0.3)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  const hintY = narrow ? CY + 296 : CY + 256;
+  ctx.fillText(narrow ? 'tap to continue' : 'SPACE  retry  ·  U  upgrades  ·  M  menu', CX, hintY);
+
+  ctx.globalAlpha = 1;
+}
+
+const ORB_KEY = [
+  { type:'cyan',  desc:'+1  essence' },
+  { type:'white', desc:'+1  health  ·  +3  essence  if  full' },
+  { type:'gold',  desc:'+5  essence  ·  3s  invulnerable  ·  ×3  score' },
+];
+
+function drawOrbKey(baseY, narrow){
+  const rowH = narrow ? 22 : 24;
+  const descFontSize = narrow ? 10 : 11;
+
+  // measure the longest description so the whole block can be centered as a unit
+  ctx.font = `300 ${descFontSize}px "IBM Plex Mono",monospace`;
+  let maxDescW = 0;
+  for (const e of ORB_KEY){
+    const w = ctx.measureText(e.desc).width;
+    if (w > maxDescW) maxDescW = w;
+  }
+  const orbDiam = 16;
+  const gap = 12;
+  const blockW = orbDiam + gap + maxDescW;
+  const blockX = CX - blockW/2;
+  const orbX = blockX + orbDiam/2;
+  const textX = blockX + orbDiam + gap;
+
+  for (let i=0;i<ORB_KEY.length;i++){
+    const entry = ORB_KEY[i];
+    const def = ORB[entry.type];
+    if (!def) continue;
+    const y = baseY + i*rowH;
+
+    // mini orb (glow ring + symbol + colored core)
+    ctx.shadowColor = def.color;
+    ctx.shadowBlur = 6;
+    ctx.strokeStyle = def.color;
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    ctx.arc(orbX, y, 7, 0, TAU);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = def.color;
+    ctx.beginPath();
+    ctx.arc(orbX, y, 2, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '300 9px "Fraunces",serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(def.symbol, orbX, y + 0.5);
+    ctx.textBaseline = 'alphabetic';
+
+    // description, left-aligned with all other descriptions
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(232,235,242,0.65)';
+    ctx.font = `300 ${descFontSize}px "IBM Plex Mono",monospace`;
+    ctx.fillText(entry.desc, textX, y + 4);
+  }
+  ctx.textAlign = 'center';
+}
+
+function drawFlash(){
+  if (game.flash > 0){
+    ctx.fillStyle = game.flashColor;
+    ctx.globalAlpha = game.flash * 0.32;
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = 1;
+  }
+  // Edge passive: cyan vignette while enemies are slowed
+  if (game.passive && game.passive.edge && game.passive.edge.slowTimer > 0){
+    const t = game.passive.edge.slowTimer;
+    // pick the right max based on level so the alpha curve is correct
+    const lvl = activePassiveLevel('edge') || 1;
+    const max = EDGE_DURATION[lvl-1];
+    const intensity = clamp(t / max, 0, 1);
+    const grad = ctx.createRadialGradient(CX, CY, Math.min(W,H)*0.3, CX, CY, Math.max(W,H)*0.7);
+    grad.addColorStop(0, `rgba(94,233,255,0)`);
+    grad.addColorStop(0.55, `rgba(94,233,255,${0.05 * intensity})`);
+    grad.addColorStop(1, `rgba(94,233,255,${0.32 * intensity})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0,0,W,H);
+    // top/bottom edge bars for unmistakable "time bent" feel
+    ctx.fillStyle = `rgba(94,233,255,${0.6 * intensity})`;
+    ctx.fillRect(0, 0, W, 2);
+    ctx.fillRect(0, H-2, W, 2);
+  }
+}
+
+function formatScore(n){
+  return n.toLocaleString('en-US');
+}
+
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, (now-last)/1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// resume gyro listener if user had enabled it before
+if (meta.gyroEnabled && gyro.permission === 'granted'){
+  startGyroListener();
+}
+</script>
+</body>
+</html>
