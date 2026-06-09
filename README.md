@@ -6,7 +6,7 @@ A mobile-first dodge roguelike. Survive 30 seconds inside the bounding circle.
 
 ## What it is
 
-Touch joystick or gyro tilt. Enemy circles spawn and home toward you. You dodge.
+Touch joystick. Enemy circles spawn and home toward you. You dodge.
 Combos slow enemies. Hits drop you one combo tier. The arena tightens as the
 clock runs down.
 

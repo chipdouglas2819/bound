@@ -52,7 +52,7 @@ for(let i=0;i<260;i++){
 }
 
 // ===== meta (persistent) =====
-const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], gyroEnabled:false, prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30 };
+const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30 };
 let meta = {...META_DEFAULT, owned:{}};
 function loadMeta(){
   try{
@@ -285,9 +285,8 @@ function applyMetaUpgrades(player, arena, opts){
 
 function tryReset(){
   if (game.resetState === 1){
-    // confirmed — wipe progression but preserve user preferences (gyro toggle)
-    const keepGyro = meta.gyroEnabled || false;
-    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{}, gyroEnabled:keepGyro };
+    // confirmed — wipe progression
+    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{} };
     saveMeta();
     game.resetState = 0;
     game.resetTimer = 0;
@@ -355,7 +354,7 @@ const MODIFIERS = [
   { id:'drifter_storm', title:'DRIFTER  STORM', desc:'Only drifters spawn. +50% spawn rate.',
     category:'CONTENT', scoreMult:1.3,
     apply(g){ g.modifierEnemyFilter = ['drifter']; g.modifierSpawnMult = 1.5; } },
-  { id:'hunters', title:'HUNTERS', desc:'Only trackers and snipers. Track from second one.',
+  { id:'hunters', title:'HUNTERS', desc:'Only trackers and snipers spawn.',
     category:'CONTENT', scoreMult:1.4,
     apply(g){ g.modifierEnemyFilter = ['tracker','sniper']; } },
   { id:'big_pieces', title:'BIG  PIECES', desc:'Only brutes. Slow but huge.',
@@ -367,16 +366,17 @@ const MODIFIERS = [
 
   { id:'tight_quarters', title:'TIGHT  QUARTERS', desc:'Arena radius −25%. Less room to move.',
     category:'SPATIAL', scoreMult:1.5,
-    apply(g){ g.arena.radius = Math.floor(BASE_ARENA_RADIUS * 0.75); } },
+    // multiplicative on current radius so Voidspace investment still counts
+    apply(g){ g.arena.radius = Math.floor(g.arena.radius * 0.75); } },
   { id:'vast_expanse', title:'VAST  EXPANSE', desc:'Arena radius +35%. Spawn rate +30%.',
     category:'SPATIAL', scoreMult:1.0,
-    apply(g){ g.arena.radius = Math.floor(BASE_ARENA_RADIUS * 1.35); g.modifierSpawnMult = 1.3; } },
+    apply(g){ g.arena.radius = Math.floor(g.arena.radius * 1.35); g.modifierSpawnMult = 1.3; } },
 
   { id:'flood', title:'FLOOD', desc:'Enemies +30% speed. Density cap reduced to 9.',
     category:'TEMPO', scoreMult:1.5,
     apply(g){ g.modifierEnemySpeedMult = 1.30; g.modifierMaxDensity = 9; } },
 
-  { id:'famine', title:'FAMINE', desc:'Orbs only spawn in the last 10 seconds.',
+  { id:'famine', title:'FAMINE', desc:'Orbs only spawn in the last 10s of each wave.',
     category:'ECONOMY', scoreMult:1.6,
     apply(g){ g.modifierOrbBlock = true; } },
 
@@ -550,8 +550,6 @@ function resumeGame(){
   game.paused = false;
   // also clear stale input on resume
   touch.active = false;
-  // recalibrate gyro so phone position when resuming becomes the new center
-  if (meta.gyroEnabled && gyro.active) recalibrateGyro();
 }
 function togglePause(){
   if (game.paused) resumeGame();
@@ -574,99 +572,6 @@ function closeSettings(){
   // cancel any pending reset confirmation when closing
   game.resetState = 0;
   game.resetTimer = 0;
-}
-
-// ===== gyro / device orientation =====
-const gyro = {
-  available: false,           // device supports DeviceOrientationEvent
-  permission: 'unknown',      // 'unknown' | 'granted' | 'denied' | 'prompt'
-  active: false,              // listener attached and feeding input
-  beta: 0, gamma: 0,           // latest readings
-  baselineBeta: null, baselineGamma: null,  // captured at run start
-  raw: { beta: 0, gamma: 0 }, // most recent raw values (pre-baseline)
-  eventCount: 0,              // total events received — diagnostic
-};
-const GYRO_SENSITIVITY = 0.045;  // degrees per second of input — higher = more responsive
-const GYRO_MAX_TILT = 22;        // tilt past which we treat as full input
-
-// quick capability detect
-if (typeof window !== 'undefined' && 'DeviceOrientationEvent' in window){
-  gyro.available = true;
-  // iOS 13+ requires permission; if not present, treat as auto-granted
-  if (typeof DeviceOrientationEvent.requestPermission !== 'function'){
-    gyro.permission = 'granted';
-  } else {
-    gyro.permission = 'prompt';
-  }
-}
-
-function gyroHandler(e){
-  if (e.beta == null || e.gamma == null) return;
-  gyro.eventCount++;
-  gyro.raw.beta = e.beta;
-  gyro.raw.gamma = e.gamma;
-  // beta: front-back tilt, -180 to 180 (90 = phone vertical face-up)
-  // gamma: left-right tilt, -90 to 90
-  if (gyro.baselineBeta === null){
-    gyro.baselineBeta = e.beta;
-    gyro.baselineGamma = e.gamma;
-  }
-  gyro.beta = e.beta - gyro.baselineBeta;
-  gyro.gamma = e.gamma - gyro.baselineGamma;
-}
-
-function startGyroListener(){
-  if (gyro.active) return;
-  gyro.eventCount = 0;
-  addEventListener('deviceorientation', gyroHandler);
-  gyro.active = true;
-}
-function stopGyroListener(){
-  if (!gyro.active) return;
-  removeEventListener('deviceorientation', gyroHandler);
-  gyro.active = false;
-  gyro.baselineBeta = null;
-  gyro.baselineGamma = null;
-}
-
-// resets baseline so next reading becomes "center" — call at start of every run
-function recalibrateGyro(){
-  gyro.baselineBeta = null;
-  gyro.baselineGamma = null;
-}
-
-// flow for the settings toggle: ask permission if needed, then enable
-async function enableGyro(){
-  if (!gyro.available){
-    game.shopMsg = 'This device has no gyroscope.';
-    game.shopMsgTimer = 2.5;
-    return;
-  }
-  if (gyro.permission === 'prompt'){
-    try {
-      const result = await DeviceOrientationEvent.requestPermission();
-      gyro.permission = result;
-      if (result !== 'granted'){
-        game.shopMsg = 'Gyro access denied.';
-        game.shopMsgTimer = 2.5;
-        return;
-      }
-    } catch (err){
-      game.shopMsg = 'Could not request gyro access.';
-      game.shopMsgTimer = 2.5;
-      return;
-    }
-  }
-  if (gyro.permission !== 'granted') return;
-  meta.gyroEnabled = true;
-  saveMeta();
-  startGyroListener();
-}
-
-function disableGyro(){
-  meta.gyroEnabled = false;
-  saveMeta();
-  stopGyroListener();
 }
 
 addEventListener('keydown', e=>{
@@ -740,13 +645,6 @@ addEventListener('pointerdown', e=>{
     e.preventDefault();
     // when paused, the screen is the resume hit area — let the standard hit detection handle it
     if (game.paused){
-      const b = hitButton(e.clientX, e.clientY);
-      if (b) b.action();
-      return;
-    }
-    // skip touch joystick entirely when gyro is the active input
-    if (meta.gyroEnabled && gyro.active){
-      // still allow pause button taps
       const b = hitButton(e.clientX, e.clientY);
       if (b) b.action();
       return;
@@ -1031,7 +929,10 @@ function awardNearMiss(e, mult){
   const bonus = 5 * mult * game.combo.mult * game.scoreMult;
   game.scoreFloat += bonus;
   game.nearMissCount++;
-  // visible feedback for the bonus case so player learns the back-pass mechanic
+  // every near-miss gets a small cyan flick — close calls are the skill currency,
+  // they should be felt without reading the score corner
+  burst(e.x, e.y, '#5ee9ff', 4, 1.3);
+  // bigger gold feedback for the bonus case so player learns the back-pass mechanic
   if (mult > 1) ringBurst(e.x, e.y, '#facc15', 14);
 
   // Edge passive — count toward threshold
@@ -1107,8 +1008,9 @@ function spawnOrb(type){
 }
 
 function updateOrbs(dt){
-  // FAMINE modifier: orbs only spawn in last 10s. Block all spawn paths until then.
-  const orbWindow = !game.modifierOrbBlock || game.timeLeft <= 10;
+  // FAMINE modifier: orbs only spawn in the last 10s of each wave. Per-wave (not per-run)
+  // so 60s/90s modes get a drought-then-relief rhythm instead of an 80-second starve.
+  const orbWindow = !game.modifierOrbBlock || (game.waveTimeLeft || game.timeLeft) <= 10;
   // spawn timers
   game.cyanOrbTimer -= dt;
   game.whiteOrbTimer -= dt;
@@ -1466,7 +1368,6 @@ function startRun(){
   game.modifierOrbBlock = false;
   game.modifierGlass = false;
   game.modifierNoPassives = false;
-  recalibrateGyro();
   // resolve mode from meta, gated by prestige unlock thresholds (defensive — UI shouldn't allow
   // an unsupported choice but stale localStorage state could have a locked value).
   let dur = meta.preferredMode || 30;
@@ -1522,6 +1423,11 @@ function startRun(){
   };
   game.greedSparkles = [];                       // {x, y, age, life}
   applyMetaUpgrades(game.player, game.arena, game);
+  // per-run modifier applies AFTER meta upgrades so its effects win conflicts:
+  // GLASS overrides Vitality's maxHp, spatial mods scale the post-Voidspace radius.
+  if (game.activeModifier && typeof game.activeModifier.apply === 'function'){
+    game.activeModifier.apply(game);
+  }
   game.player.invuln = 1.0;
   meta.runs++;
 }
@@ -1529,10 +1435,12 @@ function startRun(){
 function endRun(survived){
   if (game.scene !== 'playing' && game.scene !== 'dying') return;
   const elapsed = game.runDuration - game.timeLeft;
+  // best descent counts whether you survived or not — dying 55s into a 60s run
+  // is a longer descent than surviving a 30s one
+  if (elapsed > meta.bestTime) meta.bestTime = elapsed;
   let baseGained = game.runScore;
   if (survived){
     baseGained += Math.floor(500 * game.scoreMult);
-    if (elapsed > meta.bestTime) meta.bestTime = elapsed;
   }
   // prestige, modifier, and mode multipliers stack at banking. result screen shows the math.
   const pMult = meta.prestigeMult || 1;
@@ -1605,23 +1513,23 @@ function update(dt){
   if (ix||iy){ const m = Math.hypot(ix,iy); ix/=m; iy/=m; }
 
   // trailing joystick base: when drag exceeds STICK_MAX, slide the base behind the
-  // cursor with per-frame lerp smoothing. Doing this here rather than in pointermove
-  // means the base updates at a steady 60fps instead of per-event (mouse fires far
-  // more often than touch, which made the base look like it was bouncing).
-  if (touch.active && !(meta.gyroEnabled && gyro.active)){
+  // finger with smoothing. Done here (per-frame, dt-corrected) rather than in pointermove
+  // so update cadence doesn't depend on pointer event frequency or display refresh rate.
+  if (touch.active){
     const tdx = touch.x - touch.bx;
     const tdy = touch.y - touch.by;
     const tlen = Math.hypot(tdx, tdy);
     if (tlen > STICK_MAX){
       const targetBx = touch.x - tdx/tlen * STICK_MAX;
       const targetBy = touch.y - tdy/tlen * STICK_MAX;
-      touch.bx = lerp(touch.bx, targetBx, 0.5);
-      touch.by = lerp(touch.by, targetBy, 0.5);
+      const tk = 1 - Math.pow(0.5, dt*60);   // 0.5/frame at 60fps, equivalent feel at 120Hz
+      touch.bx = lerp(touch.bx, targetBx, tk);
+      touch.by = lerp(touch.by, targetBy, tk);
     }
   }
 
-  // touch joystick — used unless gyro is the active mobile input
-  if (ix===0 && iy===0 && touch.active && !(meta.gyroEnabled && gyro.active)){
+  // touch joystick
+  if (ix===0 && iy===0 && touch.active){
     let dx = touch.x - touch.bx;
     let dy = touch.y - touch.by;
     const len = Math.hypot(dx, dy);
@@ -1639,24 +1547,13 @@ function update(dt){
     }
   }
 
-  // gyro input (used in place of touch joystick when enabled)
-  if (ix===0 && iy===0 && meta.gyroEnabled && gyro.active){
-    const gx = clamp(gyro.gamma / GYRO_MAX_TILT, -1, 1);
-    const gy = clamp(gyro.beta / GYRO_MAX_TILT, -1, 1);
-    const gMag = Math.hypot(gx, gy);
-    if (gMag > 0.08){
-      const past = Math.min(1, (gMag - 0.08) / 0.92);
-      const eased = Math.pow(past, 1.3);
-      ix = (gx / gMag) * eased;
-      iy = (gy / gMag) * eased;
-    }
-  }
-
   let speed = p.speed * resonanceMultiplier();
 
-  // snappier response: was 0.25, bumped to 0.38 for less mushy feel on mobile
-  p.vx = lerp(p.vx, ix*speed, 0.38);
-  p.vy = lerp(p.vy, iy*speed, 0.38);
+  // velocity smoothing, dt-corrected (0.38/frame at 60fps) so the game feels identical
+  // on 120Hz displays — raw per-frame lerp would converge twice as fast there
+  const vk = 1 - Math.pow(0.62, dt*60);
+  p.vx = lerp(p.vx, ix*speed, vk);
+  p.vy = lerp(p.vy, iy*speed, vk);
   p.x += p.vx*dt; p.y += p.vy*dt;
 
   const dx = p.x-CX, dy = p.y-CY;
@@ -3129,16 +3026,10 @@ function drawSettings(narrow){
   ctx.font = `300 italic ${narrow ? 32 : 44}px "Fraunces",serif`;
   ctx.fillText('Settings.', CX, narrow ? 92 : 132);
 
-  // Section: CONTROLS
+  // Section: DATA (reset)
   const panelW = Math.min(380, W - 36);
   const panelX = CX - panelW/2;
   let panelY = narrow ? 130 : 180;
-  panelY = drawSettingsSection(panelX, panelY, panelW, 'CONTROLS', (x, y, w) => {
-    return drawGyroRow(x, y, w, narrow);
-  }, narrow);
-
-  // Section: DATA (reset)
-  panelY += 16;
   panelY = drawSettingsSection(panelX, panelY, panelW, 'DATA', (x, y, w) => {
     return drawResetRow(x, y, w, narrow);
   }, narrow);
@@ -3176,88 +3067,6 @@ function drawSettingsSection(x, y, w, label, inner, narrow){
   ctx.lineTo(x + w, endY + 6);
   ctx.stroke();
   return endY + 6;
-}
-
-function drawGyroRow(x, y, w, narrow){
-  const rowH = narrow ? 60 : 64;
-  const enabled = !!meta.gyroEnabled;
-  const supported = gyro.available;
-
-  // background card
-  ctx.fillStyle = 'rgba(15,20,35,0.4)';
-  ctx.strokeStyle = 'rgba(232,235,242,0.10)';
-  ctx.lineWidth = 1;
-  roundRect(x, y, w, rowH, 4);
-  ctx.fill();
-  ctx.stroke();
-
-  // title
-  ctx.textAlign = 'left';
-  ctx.fillStyle = supported ? '#e8ebf2' : 'rgba(232,235,242,0.4)';
-  ctx.font = '500 12px "IBM Plex Mono",monospace';
-  ctx.fillText('Gyroscopic movement', x + 14, y + 22);
-
-  // status / live readout
-  ctx.fillStyle = supported ? 'rgba(232,235,242,0.55)' : 'rgba(232,235,242,0.3)';
-  ctx.font = '300 10px "IBM Plex Mono",monospace';
-  let subText;
-  if (!supported){
-    subText = 'not supported on this device';
-  } else if (gyro.permission === 'denied'){
-    subText = 'permission denied · check browser settings';
-  } else if (enabled){
-    if (gyro.eventCount > 0){
-      // live values — proves the listener is firing
-      const b = gyro.raw.beta.toFixed(0);
-      const g = gyro.raw.gamma.toFixed(0);
-      ctx.fillStyle = '#5ee9ff';
-      subText = 'live · β ' + b + '° · γ ' + g + '°';
-    } else {
-      ctx.fillStyle = 'rgba(255,210,74,0.85)';
-      subText = 'enabled but receiving no data · try moving the device';
-    }
-  } else {
-    subText = 'tilt the device to move';
-  }
-  ctx.fillText(subText, x + 14, y + 42);
-
-  // toggle pill on the right
-  const tw = 50, th = 26;
-  const tx = x + w - 14 - tw;
-  const ty = y + (rowH - th)/2;
-  const interactive = supported && gyro.permission !== 'denied';
-  const hov = interactive && mx>=tx && mx<=tx+tw && my>=ty && my<=ty+th;
-
-  if (enabled){
-    ctx.fillStyle = hov ? 'rgba(94,233,255,0.32)' : 'rgba(94,233,255,0.22)';
-    ctx.strokeStyle = '#5ee9ff';
-  } else if (interactive){
-    ctx.fillStyle = hov ? 'rgba(232,235,242,0.08)' : 'rgba(15,20,35,0.6)';
-    ctx.strokeStyle = hov ? 'rgba(232,235,242,0.5)' : 'rgba(232,235,242,0.25)';
-  } else {
-    ctx.fillStyle = 'rgba(15,20,35,0.4)';
-    ctx.strokeStyle = 'rgba(232,235,242,0.12)';
-  }
-  ctx.lineWidth = 1.2;
-  roundRect(tx, ty, tw, th, th/2);
-  ctx.fill();
-  ctx.stroke();
-
-  // knob inside pill
-  const knobR = th/2 - 4;
-  const knobX = enabled ? (tx + tw - knobR - 4) : (tx + knobR + 4);
-  ctx.fillStyle = enabled ? '#5ee9ff' : (interactive ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.3)');
-  ctx.beginPath();
-  ctx.arc(knobX, ty + th/2, knobR, 0, TAU);
-  ctx.fill();
-
-  if (interactive){
-    game.buttonHits.push({ x:tx, y:ty, w:tw, h:th, action:()=>{
-      if (enabled) disableGyro();
-      else enableGyro();
-    }});
-  }
-  return rowH;
 }
 
 function drawResetRow(x, y, w, narrow){
@@ -4317,11 +4126,6 @@ function frame(now){
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-
-// resume gyro listener if user had enabled it before
-if (meta.gyroEnabled && gyro.permission === 'granted'){
-  startGyroListener();
-}
 </script>
 </body>
 </html>
