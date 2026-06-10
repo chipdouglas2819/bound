@@ -2,12 +2,21 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>BOUND</title>
+<meta name="theme-color" content="#060810">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="BOUND">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..600&family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
+:root{--sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px)}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#060810;font-family:'IBM Plex Mono',ui-monospace,monospace;color:#e8ebf2;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
 canvas{display:block;position:absolute;inset:0;touch-action:none}
@@ -27,6 +36,7 @@ const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 let DPR = Math.min(window.devicePixelRatio||1, 2);
 let W=0, H=0, CX=0, CY=0;
+let SAFE_T=0, SAFE_B=0;   // safe-area insets (Dynamic Island / home indicator) in standalone PWA mode
 
 function resize(){
   W = window.innerWidth; H = window.innerHeight;
@@ -34,6 +44,11 @@ function resize(){
   canvas.width = W*DPR; canvas.height = H*DPR;
   canvas.style.width = W+'px'; canvas.style.height = H+'px';
   ctx.setTransform(DPR,0,0,DPR,0,0);
+  try {
+    const cs = getComputedStyle(document.documentElement);
+    SAFE_T = parseFloat(cs.getPropertyValue('--sat')) || 0;
+    SAFE_B = parseFloat(cs.getPropertyValue('--sab')) || 0;
+  } catch { SAFE_T = 0; SAFE_B = 0; }
 }
 resize();
 addEventListener('resize', resize);
@@ -52,7 +67,7 @@ for(let i=0;i<260;i++){
 }
 
 // ===== meta (persistent) =====
-const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30 };
+const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30, soundOn:true };
 let meta = {...META_DEFAULT, owned:{}};
 function loadMeta(){
   try{
@@ -228,6 +243,7 @@ function buyPassive(p){
     meta.equipped.push(p.id);
   }
   saveMeta();
+  sfx.buy();
   return true;
 }
 
@@ -271,6 +287,7 @@ function buyUpgrade(u){
   meta.totalScore -= nextCost(u);
   meta.owned[u.id] = levelOf(u.id) + 1;
   saveMeta();
+  sfx.buy();
   return true;
 }
 
@@ -285,8 +302,9 @@ function applyMetaUpgrades(player, arena, opts){
 
 function tryReset(){
   if (game.resetState === 1){
-    // confirmed — wipe progression
-    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{} };
+    // confirmed — wipe progression but keep user preferences (sound)
+    const keepSound = meta.soundOn !== false;
+    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{}, soundOn:keepSound };
     saveMeta();
     game.resetState = 0;
     game.resetTimer = 0;
@@ -332,6 +350,8 @@ function ascend(){
   saveMeta();
   // celebratory feedback — a moment of "you did something significant"
   game.ascendAnim = 1.5;
+  sfx.ascend();
+  buzz([20, 30, 40]);
   ringBurst(CX, CY, '#facc15', 36);
   burst(CX, CY, '#facc15', 24, 3);
   burst(CX, CY, '#ffffff', 16, 2.2);
@@ -416,7 +436,9 @@ function rollModifierPicks(){
 
 function beginRun(){
   // gated entry point used by all "start a run" buttons. Routes to picker if modifiers unlocked.
-  if ((meta.prestige || 0) >= 9){
+  // P4 (was P9): modifiers are the cheapest replayability in the game — they should arrive
+  // while the 30s loop is still the player's whole world, not after 60-100 runs of grind.
+  if ((meta.prestige || 0) >= 4){
     rollModifierPicks();
     game.activeModifier = null;  // cleared until pick or default
     game.scene = 'modifierPick';
@@ -574,6 +596,73 @@ function closeSettings(){
   game.resetTimer = 0;
 }
 
+// ===== audio — tiny WebAudio synth, no assets =====
+// Context is created lazily on first pointer interaction (autoplay policy).
+// Every sound is one or two oscillator/noise envelopes; total engine ~60 lines.
+let AC = null;
+let noiseBuf = null;
+function audioCtx(){
+  if (meta.soundOn === false) return null;
+  if (!AC){
+    try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch { return null; }
+  }
+  if (AC && AC.state === 'suspended'){ try { AC.resume(); } catch {} }
+  return AC;
+}
+function tone(o){
+  const c = audioCtx(); if (!c) return;
+  const t = o.t || 0.1, g = o.g || 0.18, when = o.when || 0;
+  const s = c.currentTime + when;
+  const osc = c.createOscillator(), gn = c.createGain();
+  osc.type = o.type || 'sine';
+  const f0 = o.f0 || 440, f1 = o.f1 || f0;
+  osc.frequency.setValueAtTime(f0, s);
+  if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(1, f1), s + t);
+  gn.gain.setValueAtTime(g, s);
+  gn.gain.exponentialRampToValueAtTime(0.0001, s + t);
+  osc.connect(gn); gn.connect(c.destination);
+  osc.start(s); osc.stop(s + t + 0.03);
+}
+function noiseHit(o){
+  const c = audioCtx(); if (!c) return;
+  const t = o.t || 0.08, g = o.g || 0.2, fc = o.fc || 600;
+  if (!noiseBuf){
+    noiseBuf = c.createBuffer(1, (c.sampleRate * 0.25) | 0, c.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const src = c.createBufferSource(); src.buffer = noiseBuf;
+  const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = fc; bp.Q.value = 0.8;
+  const gn = c.createGain();
+  const s = c.currentTime;
+  gn.gain.setValueAtTime(g, s);
+  gn.gain.exponentialRampToValueAtTime(0.0001, s + t);
+  src.connect(bp); bp.connect(gn); gn.connect(c.destination);
+  src.start(s); src.stop(s + t + 0.03);
+}
+const sfx = {
+  hit(){ tone({f0:170, f1:55, type:'square', t:0.13, g:0.26}); noiseHit({t:0.08, g:0.16, fc:300}); },
+  crystal(){ tone({f0:980, f1:620, type:'triangle', t:0.10, g:0.16}); },
+  near(){ tone({f0:1250, f1:1900, type:'sine', t:0.045, g:0.06}); },
+  orb(kind){
+    if (kind === 'gold'){ tone({f0:660, t:0.09, g:0.15}); tone({f0:880, t:0.09, g:0.15, when:0.07}); tone({f0:1320, t:0.14, g:0.15, when:0.14}); }
+    else if (kind === 'heal'){ tone({f0:520, f1:780, type:'sine', t:0.16, g:0.16}); }
+    else tone({f0:660, f1:700, type:'sine', t:0.08, g:0.12});
+  },
+  tier(n){ tone({f0:500, f1:740, type:'triangle', t:0.10, g:0.15}); if (n >= 3) tone({f0:740, f1:1100, type:'triangle', t:0.12, g:0.15, when:0.08}); },
+  wave(){ tone({f0:220, f1:330, type:'triangle', t:0.28, g:0.18}); tone({f0:110, f1:165, type:'sine', t:0.28, g:0.16}); },
+  death(){ tone({f0:130, f1:36, type:'sawtooth', t:0.5, g:0.26}); noiseHit({t:0.3, g:0.16, fc:180}); },
+  phoenix(){ tone({f0:520, t:0.1, g:0.16}); tone({f0:780, t:0.1, g:0.16, when:0.08}); tone({f0:1040, f1:1560, t:0.18, g:0.16, when:0.16}); },
+  ascend(){ tone({f0:520, t:0.12, g:0.16}); tone({f0:660, t:0.12, g:0.16, when:0.1}); tone({f0:880, t:0.14, g:0.16, when:0.2}); tone({f0:1320, f1:1760, t:0.3, g:0.14, when:0.3}); },
+  buy(){ tone({f0:660, f1:990, type:'sine', t:0.09, g:0.13}); },
+};
+
+// ===== haptics — gameplay-significant moments only =====
+// Android Chrome honors navigator.vibrate; iOS Safari ignores it (no-op there).
+function buzz(pattern){
+  try { if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(pattern); } catch {}
+}
+
 addEventListener('keydown', e=>{
   const k = e.key.toLowerCase();
   if (keys[k]) return;
@@ -640,6 +729,7 @@ addEventListener('pointermove', e=>{
 });
 addEventListener('pointerdown', e=>{
   mx = e.clientX; my = e.clientY;
+  audioCtx();   // create/resume AudioContext inside a user gesture (autoplay policy)
   if (game.scene === 'playing'){
     // mouse falls through so PC drag works as a virtual joystick (analog testing path)
     e.preventDefault();
@@ -932,6 +1022,7 @@ function awardNearMiss(e, mult){
   // every near-miss gets a small cyan flick — close calls are the skill currency,
   // they should be felt without reading the score corner
   burst(e.x, e.y, '#5ee9ff', 4, 1.3);
+  sfx.near();
   // bigger gold feedback for the bonus case so player learns the back-pass mechanic
   if (mult > 1) ringBurst(e.x, e.y, '#facc15', 14);
 
@@ -1065,6 +1156,7 @@ function collectOrb(o){
     game.runEssence += 1;
     game.cyanCount++;
     orbPickupBurst(o.x, o.y, '#5ee9ff', 12);
+    sfx.orb('cyan');
   } else if (o.type === 'white'){
     if (p.hp < p.maxHp){
       p.hp += 1;
@@ -1072,11 +1164,13 @@ function collectOrb(o){
       game.whiteCount++;
       orbPickupBurst(o.x, o.y, '#ffffff', 18);
       ringBurst(p.x, p.y, '#ffffff', 14);
+      sfx.orb('heal');
     } else {
       // already full → essence
       game.runEssence += 3;
       game.whiteCount++;
       orbPickupBurst(o.x, o.y, '#5ee9ff', 16);
+      sfx.orb('cyan');
     }
   } else if (o.type === 'gold'){
     game.runEssence += 5;
@@ -1085,6 +1179,8 @@ function collectOrb(o){
     p.goldBoost = 3.0;        // 3 second window where score is x3
     orbPickupBurst(o.x, o.y, '#facc15', 24);
     ringBurst(p.x, p.y, '#facc15', 22);
+    sfx.orb('gold');
+    buzz(20);
   }
 
   // ECHO passive — spawn afterimage at pickup location (player's current position is the orb's location)
@@ -1311,6 +1407,7 @@ function updatePassives(dt){
       const cd = dist(s.x, s.y, p.x, p.y);
       if (cd < p.radius + 8){
         game.runEssence += 1;
+        sfx.orb('cyan');
         // small white burst
         for (let k=0;k<6;k++){
           const a = Math.random()*TAU;
@@ -1580,9 +1677,17 @@ function update(dt){
   if (newTier > cb.tier){
     cb.tierFlash = 1;
     ringBurst(p.x, p.y, '#5ee9ff', 14);
+    sfx.tier(newTier);
+    // toast teaches the core mechanic — combos change the world, not just the score
+    if (newTier >= 2){
+      const slowPct = newTier >= 3 ? '30%' : '15%';
+      game.comboToast = { text: '×' + COMBO_TIERS[newTier-1].mult.toFixed(1) + '  ·  enemies slowed ' + slowPct, t: 1.8, tier: newTier };
+      buzz(12);
+    }
   }
   cb.tier = newTier;
   cb.mult = newMult;
+  if (game.comboToast && game.comboToast.t > 0) game.comboToast.t -= dt;
   if (cb.tierFlash > 0) cb.tierFlash = Math.max(0, cb.tierFlash - dt * 1.8);
   if (cb.breakFlash > 0) cb.breakFlash = Math.max(0, cb.breakFlash - dt * 1.6);
 
@@ -1603,6 +1708,8 @@ function update(dt){
     game.flash = 0.35;
     game.flashColor = '#facc15';
     ringBurst(CX, CY, '#facc15', 32);
+    sfx.wave();
+    buzz(20);
   }
   // effective time-remaining within the current wave (used by unlockedTypes for the difficulty ramp)
   game.waveTimeLeft = 30 - (elapsedTotal - (game.wave - 1) * 30);
@@ -1746,6 +1853,8 @@ function damagePlayer(){
     game.shake = 4;
     game.flash = 0.25;
     game.flashColor = '#5ee9ff';
+    sfx.crystal();
+    buzz(15);
     // shimmer burst — implies the crystal shattered
     ringBurst(p.x, p.y, '#5ee9ff', 26);
     burst(p.x, p.y, '#ffffff', 14, 2);
@@ -1760,6 +1869,8 @@ function damagePlayer(){
   game.shake = 8;
   game.flash = 0.45;
   game.flashColor = '#ff6b8a';
+  sfx.hit();
+  buzz(35);
   // combo partial-break — drop one tier per hit instead of zeroing.
   // keeps recovery possible without making hits painless: high-tier runs still
   // cost real time to (re)build, sloppy runs still pay a real per-hit cost.
@@ -1793,11 +1904,15 @@ function damagePlayer(){
       burst(p.x, p.y, '#ffffff', 14, 2);
       game.flash = 0.5;
       game.flashColor = '#facc15';
+      sfx.phoenix();
+      buzz([30, 40, 30]);
       return;
     }
     p.hp = 0;
     burst(p.x, p.y, '#5ee9ff', 36, 4);
     burst(p.x, p.y, '#ffffff', 18, 3);
+    sfx.death();
+    buzz(60);
     game.scene = 'dying';
     setTimeout(()=>{ if (game.scene === 'dying') endRun(false); }, 500);
   }
@@ -2015,8 +2130,8 @@ function drawPlayer(){
   // prestige aura — subtle gold halo unlocked at rank 3, intensifies with higher ranks.
   // drawn under the combo aura so they layer cleanly when a high-prestige player gets a combo.
   const prank = meta.prestige || 0;
-  if (prank >= 3){
-    const intensity = Math.min(1, (prank - 2) / 7);  // smooth ramp from rank 3 to rank ~10
+  if (prank >= 2){
+    const intensity = Math.min(1, (prank - 1) / 8);  // smooth ramp from rank 2 to rank ~10
     const pulse = 0.7 + 0.3 * Math.sin(game.t * 1.8);
     const auraR = p.radius + 22 + intensity * 5;
     const grad = ctx.createRadialGradient(p.x, p.y, p.radius - 2, p.x, p.y, auraR);
@@ -2478,7 +2593,7 @@ function drawParticles(){
 function drawPauseButton(){
   // small unobtrusive icon in the top-left corner
   // sized to fit above the essence display (which baselines at y=36)
-  const x = 10, y = 8, size = 24;
+  const x = 10, y = 8 + SAFE_T, size = 24;
   const cx = x + size/2, cy = y + size/2;
   const hov = mx>=x && mx<=x+size && my>=y && my<=y+size;
 
@@ -2545,31 +2660,31 @@ function drawHUD(){
   ctx.textAlign = 'center';
   ctx.fillStyle = 'rgba(232,235,242,0.5)';
   ctx.font = '300 10px "IBM Plex Mono",monospace';
-  ctx.fillText('TIME', CX, 36);
+  ctx.fillText('TIME', CX, 36 + SAFE_T);
   const tl = game.timeLeft;
   const danger = tl < 8;
   ctx.fillStyle = danger ? '#ff9a3f' : '#e8ebf2';
   ctx.font = `300 italic 48px "Fraunces",serif`;
-  ctx.fillText(tl.toFixed(1), CX, 86);
+  ctx.fillText(tl.toFixed(1), CX, 86 + SAFE_T);
 
   // essence (top-left) — only after first pickup this run
   if (game.runEssence > 0){
     ctx.textAlign = 'left';
     ctx.fillStyle = 'rgba(232,235,242,0.5)';
     ctx.font = '300 10px "IBM Plex Mono",monospace';
-    ctx.fillText('ESSENCE', 28, 36);
+    ctx.fillText('ESSENCE', 28, 36 + SAFE_T);
     ctx.fillStyle = '#5ee9ff';
     ctx.font = '400 22px "IBM Plex Mono",monospace';
-    ctx.fillText(String(game.runEssence).padStart(2,'0'), 28, 60);
+    ctx.fillText(String(game.runEssence).padStart(2,'0'), 28, 60 + SAFE_T);
   }
 
   ctx.textAlign = 'right';
   ctx.fillStyle = 'rgba(232,235,242,0.5)';
   ctx.font = '300 10px "IBM Plex Mono",monospace';
-  ctx.fillText('SCORE', W-28, 36);
+  ctx.fillText('SCORE', W-28, 36 + SAFE_T);
   ctx.fillStyle = '#e8ebf2';
   ctx.font = '400 22px "IBM Plex Mono",monospace';
-  ctx.fillText(String(game.runScore).padStart(3,'0'), W-28, 60);
+  ctx.fillText(String(game.runScore).padStart(3,'0'), W-28, 60 + SAFE_T);
 
   // combo multiplier (only when active or just broken)
   const cb = game.combo;
@@ -2589,7 +2704,7 @@ function drawHUD(){
     }
     ctx.fillStyle = color;
     ctx.font = `400 italic ${baseSize}px "Fraunces",serif`;
-    ctx.fillText(label, W-28, 86);
+    ctx.fillText(label, W-28, 86 + SAFE_T);
   }
 
   // gold orb boost indicator — visible when active, around the player area
@@ -2599,7 +2714,29 @@ function drawHUD(){
     const boostFrac = p.goldBoost / 3;
     ctx.fillStyle = `rgba(250,204,21,${0.4 + 0.6*boostFrac})`;
     ctx.font = '400 italic 16px "Fraunces",serif';
-    ctx.fillText('×3 BOOST  ' + p.goldBoost.toFixed(1) + 's', CX, 110);
+    ctx.fillText('×3 BOOST  ' + p.goldBoost.toFixed(1) + 's', CX, 110 + SAFE_T);
+  }
+
+  // tier-up toast — the line that teaches combos slow the world
+  if (game.comboToast && game.comboToast.t > 0){
+    const ct = game.comboToast;
+    const a = Math.min(1, ct.t / 0.6);   // hold, then fade out over the last 0.6s
+    ctx.textAlign = 'center';
+    ctx.fillStyle = ct.tier >= 3 ? `rgba(255,210,74,${a})` : `rgba(94,233,255,${a})`;
+    ctx.font = '300 italic 15px "Fraunces",serif';
+    ctx.fillText(ct.text, CX, 118 + SAFE_T);
+  }
+
+  // first-runs movement hint — drawn below the arena so a thumb doesn't cover it
+  if (meta.runs <= 3 && game.scene === 'playing'){
+    const hintElapsed = game.runDuration - game.timeLeft;
+    if (hintElapsed < 6){
+      const a = hintElapsed < 0.5 ? hintElapsed*2 : (hintElapsed > 5 ? 6 - hintElapsed : 1);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = `rgba(232,235,242,${0.55*a})`;
+      ctx.font = '300 12px "IBM Plex Mono",monospace';
+      ctx.fillText('drag anywhere to move · survive', CX, CY + game.arena.radius + 42);
+    }
   }
 }
 
@@ -2738,7 +2875,7 @@ function drawMenu(){
 
   ctx.fillStyle = 'rgba(232,235,242,0.3)';
   ctx.font = '300 10px "IBM Plex Mono",monospace';
-  ctx.fillText('keys · WASD · arrows  /  touch + drag', CX, H - 30);
+  ctx.fillText('keys · WASD · arrows  /  touch + drag', CX, H - 30 - SAFE_B);
 
   // gear icon (top-right) — opens settings
   drawGearIcon();
@@ -3026,17 +3163,23 @@ function drawSettings(narrow){
   ctx.font = `300 italic ${narrow ? 32 : 44}px "Fraunces",serif`;
   ctx.fillText('Settings.', CX, narrow ? 92 : 132);
 
-  // Section: DATA (reset)
+  // Section: SOUND
   const panelW = Math.min(380, W - 36);
   const panelX = CX - panelW/2;
   let panelY = narrow ? 130 : 180;
+  panelY = drawSettingsSection(panelX, panelY, panelW, 'SOUND', (x, y, w) => {
+    return drawSoundRow(x, y, w, narrow);
+  }, narrow);
+
+  // Section: DATA (reset)
+  panelY += 16;
   panelY = drawSettingsSection(panelX, panelY, panelW, 'DATA', (x, y, w) => {
     return drawResetRow(x, y, w, narrow);
   }, narrow);
 
   // Close button at bottom
   const closeW = narrow ? Math.min(280, W-48) : 220;
-  const closeY = H - 70;
+  const closeY = H - 70 - SAFE_B;
   drawButton(CX - closeW/2, closeY, closeW, 44, 'CLOSE', closeSettings, false);
 
   if (game.shopMsgTimer > 0){
@@ -3067,6 +3210,56 @@ function drawSettingsSection(x, y, w, label, inner, narrow){
   ctx.lineTo(x + w, endY + 6);
   ctx.stroke();
   return endY + 6;
+}
+
+function drawSoundRow(x, y, w, narrow){
+  const rowH = narrow ? 60 : 64;
+  const enabled = meta.soundOn !== false;
+
+  ctx.fillStyle = 'rgba(15,20,35,0.4)';
+  ctx.strokeStyle = 'rgba(232,235,242,0.10)';
+  ctx.lineWidth = 1;
+  roundRect(x, y, w, rowH, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = '500 12px "IBM Plex Mono",monospace';
+  ctx.fillText('Sound effects', x + 14, y + 22);
+  ctx.fillStyle = 'rgba(232,235,242,0.55)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText(enabled ? 'hits · orbs · combo cues' : 'muted', x + 14, y + 42);
+
+  // toggle pill
+  const tw = 50, th = 26;
+  const tx = x + w - 14 - tw;
+  const ty = y + (rowH - th)/2;
+  const hov = mx>=tx && mx<=tx+tw && my>=ty && my<=ty+th;
+  if (enabled){
+    ctx.fillStyle = hov ? 'rgba(94,233,255,0.32)' : 'rgba(94,233,255,0.22)';
+    ctx.strokeStyle = '#5ee9ff';
+  } else {
+    ctx.fillStyle = hov ? 'rgba(232,235,242,0.08)' : 'rgba(15,20,35,0.6)';
+    ctx.strokeStyle = hov ? 'rgba(232,235,242,0.5)' : 'rgba(232,235,242,0.25)';
+  }
+  ctx.lineWidth = 1.2;
+  roundRect(tx, ty, tw, th, th/2);
+  ctx.fill();
+  ctx.stroke();
+  const knobR = th/2 - 4;
+  const knobX = enabled ? (tx + tw - knobR - 4) : (tx + knobR + 4);
+  ctx.fillStyle = enabled ? '#5ee9ff' : 'rgba(232,235,242,0.7)';
+  ctx.beginPath();
+  ctx.arc(knobX, ty + th/2, knobR, 0, TAU);
+  ctx.fill();
+
+  game.buttonHits.push({ x:tx, y:ty, w:tw, h:th, action:()=>{
+    meta.soundOn = !enabled;
+    saveMeta();
+    if (meta.soundOn) sfx.buy();   // confirmation blip when turning ON
+  }});
+  return rowH;
 }
 
 function drawResetRow(x, y, w, narrow){
@@ -3124,7 +3317,7 @@ function drawResetRow(x, y, w, narrow){
 function drawGearIcon(){
   const size = 28;
   const x = W - 14 - size;
-  const y = 14;
+  const y = 14 + SAFE_T;
   const cx = x + size/2;
   const cy = y + size/2;
   const hov = mx>=x && mx<=x+size && my>=y && my<=y+size;
@@ -3235,7 +3428,7 @@ function drawShop(){
   const totalW = cols*cardW + (cols-1)*gx;
 
   const headerEnd = tabY + 30;
-  const backY = H - 70;
+  const backY = H - 70 - SAFE_B;
   const cardsAreaTop = headerEnd;
   const cardsAreaBottom = backY - 18;
   const cardsAreaH = Math.max(80, cardsAreaBottom - cardsAreaTop);

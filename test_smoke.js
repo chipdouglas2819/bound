@@ -44,10 +44,11 @@ global.addEventListener = () => {};
 global.removeEventListener = () => {};
 global.localStorage = { getItem: () => null, setItem(){}, removeItem(){} };
 global.requestAnimationFrame = () => {};
+global.getComputedStyle = () => ({ getPropertyValue: () => '0px' });
 
 // expose internals for the test driver
 src += `;globalThis.__T = { game, meta, shopUI, MODIFIERS, COMBO_TIERS,
-  startRun, endRun, beginRun, selectModifier, update, render, ascend, canAscend, totalStatLevels };`;
+  startRun, endRun, beginRun, selectModifier, update, render, ascend, canAscend, totalStatLevels, damagePlayer };`;
 
 let step = 'eval';
 const results = [];
@@ -128,8 +129,29 @@ try {
 } catch(e){ fail(step, e); }
 
 try {
-  step='modifier picker at P9 + pick + render';
-  T.meta.prestige = 9;
+  step='soundOn defaults true; sfx paths are node-safe';
+  if (T.meta.soundOn !== true) throw new Error('soundOn=' + T.meta.soundOn);
+  // exercise damage -> sfx.hit + buzz with no AudioContext / navigator (must not throw)
+  T.meta.prestige = 0; T.game.scene = 'menu'; T.beginRun();
+  T.game.player.invuln = -1;
+  const hpBefore = T.game.player.hp;
+  T.damagePlayer();
+  if (T.game.player.hp !== hpBefore - 1) throw new Error('hp did not drop');
+  pass(step);
+} catch(e){ fail(step, e); }
+
+try {
+  step='no picker below P4 (straight to playing)';
+  T.meta.prestige = 3;
+  T.game.scene = 'menu';
+  T.beginRun();
+  if (T.game.scene !== 'playing') throw new Error('scene=' + T.game.scene);
+  pass(step);
+} catch(e){ fail(step, e); }
+
+try {
+  step='modifier picker at P4 + pick + render';
+  T.meta.prestige = 4;
   T.game.scene = 'menu';
   T.beginRun();
   if (T.game.scene !== 'modifierPick') throw new Error('scene=' + T.game.scene);
