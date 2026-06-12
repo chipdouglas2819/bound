@@ -37,6 +37,8 @@ const ctx = canvas.getContext('2d');
 let DPR = Math.min(window.devicePixelRatio||1, 2);
 let W=0, H=0, CX=0, CY=0;
 let SAFE_T=0, SAFE_B=0;   // safe-area insets (Dynamic Island / home indicator) in standalone PWA mode
+// dev mode (?dev=1) — exposes prestige/currency shortcuts on the menu for deep-content testing
+const DEV = (typeof location !== 'undefined') && /[?&]dev=1/.test(location.search || '');
 
 function resize(){
   W = window.innerWidth; H = window.innerHeight;
@@ -67,8 +69,8 @@ for(let i=0;i<260;i++){
 }
 
 // ===== meta (persistent) =====
-const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30, soundOn:true };
-let meta = {...META_DEFAULT, owned:{}};
+const META_DEFAULT = { totalScore:0, totalEssence:0, owned:{}, runs:0, bestTime:0, seenOrbs:{}, passives:{}, equipped:[], prestige:0, prestigeMult:1.0, seenAscensionBanner:false, preferredMode:30, soundOn:true, achievements:{}, modifiersPlayed:{}, bests:{}, daily:null };
+let meta = {...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{}, achievements:{}, modifiersPlayed:{}, bests:{}};
 function loadMeta(){
   try{
     const s = localStorage.getItem('bound_meta_v2');
@@ -81,6 +83,10 @@ function loadMeta(){
         seenOrbs: d.seenOrbs || {},
         passives: d.passives || {},
         equipped: d.equipped || [],
+        achievements: d.achievements || {},
+        modifiersPlayed: d.modifiersPlayed || {},
+        bests: d.bests || {},
+        daily: d.daily || null,
       };
     }
   }catch{}
@@ -304,7 +310,7 @@ function tryReset(){
   if (game.resetState === 1){
     // confirmed — wipe progression but keep user preferences (sound)
     const keepSound = meta.soundOn !== false;
-    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{}, soundOn:keepSound };
+    meta = { ...META_DEFAULT, owned:{}, passives:{}, equipped:[], seenOrbs:{}, achievements:{}, modifiersPlayed:{}, bests:{}, daily:null, soundOn:keepSound };
     saveMeta();
     game.resetState = 0;
     game.resetTimer = 0;
@@ -332,12 +338,12 @@ function totalStatLevels(){
   return total;
 }
 
-// First ascension requires 12 stat levels owned (~44% upgrade saturation).
-// After that, always available — no need to re-earn the right to ascend.
+// EVERY ascension requires 12 stat levels owned (~44% upgrade saturation).
+// (It used to be free after the first — but wiping an empty inventory costs
+// nothing, so post-P1 players could tap their way to P12. The levels ARE the cost.)
 function canAscend(){
   if (game.scene === 'playing') return false;
-  if ((meta.prestige || 0) === 0) return totalStatLevels() >= 12;
-  return true;
+  return totalStatLevels() >= 12;
 }
 
 function ascend(){
@@ -347,6 +353,13 @@ function ascend(){
   meta.owned = {};            // wipe stat upgrades
   meta.totalScore = 0;        // wipe banked score
   meta.seenAscensionBanner = true;  // dismiss banner if it was up
+  // unlock toast for ladder thresholds + prestige-driven achievements
+  const UNLOCK_AT = { 2:'Gold aura unlocked', 4:'Per-run modifiers unlocked', 6:'60s EXTENDED mode unlocked', 12:'90s ENDURANCE mode unlocked' };
+  if (UNLOCK_AT[meta.prestige]){
+    game.shopMsg = UNLOCK_AT[meta.prestige];
+    game.shopMsgTimer = 4;
+  }
+  checkAchievements({ r:{}, hitsTaken:1, maxComboTier:0, modifierId:null, didBackPass:false });
   saveMeta();
   // celebratory feedback — a moment of "you did something significant"
   game.ascendAnim = 1.5;
@@ -395,6 +408,15 @@ const MODIFIERS = [
   { id:'flood', title:'FLOOD', desc:'Enemies +30% speed. Density cap reduced to 9.',
     category:'TEMPO', scoreMult:1.5,
     apply(g){ g.modifierEnemySpeedMult = 1.30; g.modifierMaxDensity = 9; } },
+  { id:'drag', title:'DRAG', desc:'Enemies −20% speed. +30% more of them.',
+    category:'TEMPO', scoreMult:1.3,
+    apply(g){ g.modifierEnemySpeedMult = 0.8; g.modifierSpawnMult = 1.3; } },
+  { id:'bursts', title:'BURSTS', desc:'Quiet and dense spawning alternate every 5s.',
+    category:'TEMPO', scoreMult:1.4,
+    apply(g){ g.modifierBursts = true; } },
+  { id:'fragile', title:'FRAGILE  COMBO', desc:'Near-misses shatter your combo. Dodge wide.',
+    category:'CHALLENGE', scoreMult:1.4,
+    apply(g){ g.modifierFragileCombo = true; } },
 
   { id:'famine', title:'FAMINE', desc:'Orbs only spawn in the last 10s of each wave.',
     category:'ECONOMY', scoreMult:1.6,
@@ -451,6 +473,71 @@ function beginRun(){
 function selectModifier(m){
   game.activeModifier = m;
   startRun();
+}
+
+// ===== daily challenge =====
+// One attempt per day. The modifier is derived from the date, so everyone playing
+// today faces the same condition. Playable from prestige 0 — it doubles as the
+// modifier system's teaser for players who haven't reached P4 yet.
+function todayStr(){
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function dateHash(s){
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h;
+}
+function dailyModifier(){
+  return MODIFIERS[dateHash(todayStr()) % MODIFIERS.length];
+}
+function dailyDoneToday(){
+  return !!(meta.daily && meta.daily.date === todayStr() && meta.daily.done);
+}
+function startDaily(){
+  if (dailyDoneToday()) return;
+  game.activeModifier = dailyModifier();
+  startRun();
+  game.isDaily = true;
+}
+
+// ===== achievements =====
+// Status + a small one-time essence reward each. Checked at endRun and on ascend.
+const ACHIEVEMENT_REWARD = 5;
+const ACHIEVEMENTS = [
+  { id:'first_run',  title:'FIRST DESCENT',     desc:'Complete a run',                          check:c => true },
+  { id:'survivor',   title:'UNBROKEN',          desc:'Survive a full 30s run',                  check:c => c.r.survived && c.r.runDuration === 30 },
+  { id:'untouched',  title:'UNTOUCHED',         desc:'Survive a run without taking a hit',      check:c => c.r.survived && c.hitsTaken === 0 },
+  { id:'flow',       title:'FLOW STATE',        desc:'Reach a ×2.0 combo',                      check:c => c.maxComboTier >= 3 },
+  { id:'needle',     title:'THREAD THE NEEDLE', desc:'20 close calls in one run',               check:c => c.r.nearMisses >= 20 },
+  { id:'harvester',  title:'HARVESTER',         desc:'Collect 20 essence in one run',           check:c => c.r.essence >= 20 },
+  { id:'midas',      title:'MIDAS',             desc:'Catch a gold orb',                        check:c => c.r.gold > 0 },
+  { id:'reborn',     title:'REBORN',            desc:'Ascend for the first time',               check:c => (meta.prestige||0) >= 1 },
+  { id:'fate',       title:'ARCHITECT OF FATE', desc:'Reach prestige 4 · modifiers unlock',     check:c => (meta.prestige||0) >= 4 },
+  { id:'extended',   title:'EXTENDED STAY',     desc:'Reach prestige 6 · 60s mode unlocks',     check:c => (meta.prestige||0) >= 6 },
+  { id:'marathon',   title:'MARATHON',          desc:'Survive a 60s run',                       check:c => c.r.survived && c.r.runDuration === 60 },
+  { id:'eternal',    title:'ETERNAL',           desc:'Survive a 90s run',                       check:c => c.r.survived && c.r.runDuration === 90 },
+  { id:'glasswork',  title:'GLASSWORK',         desc:'Survive a GLASS run',                     check:c => c.r.survived && c.modifierId === 'glass' },
+  { id:'shapeshift', title:'SHAPESHIFTER',      desc:'Finish runs with 5 different modifiers',  check:c => Object.keys(meta.modifiersPlayed||{}).length >= 5 },
+  { id:'flanked',    title:'FLANKED',           desc:'Slip behind a shielded foe',              check:c => c.didBackPass },
+  { id:'ritual',     title:'RITUAL',            desc:'Complete a daily challenge',              check:c => !!(meta.daily && meta.daily.done) },
+  { id:'devoted',    title:'DEVOTED',           desc:'3-day daily streak',                      check:c => !!(meta.daily && meta.daily.streak >= 3) },
+];
+
+function checkAchievements(c){
+  const earned = [];
+  meta.achievements = meta.achievements || {};
+  for (const a of ACHIEVEMENTS){
+    if (meta.achievements[a.id]) continue;
+    let ok = false;
+    try { ok = a.check(c); } catch {}
+    if (ok){
+      meta.achievements[a.id] = true;
+      meta.totalEssence = (meta.totalEssence || 0) + ACHIEVEMENT_REWARD;
+      earned.push(a);
+    }
+  }
+  return earned;
 }
 
 // ===== game state (per run) =====
@@ -589,6 +676,7 @@ if (typeof document !== 'undefined' && document.addEventListener){
 
 // ===== settings overlay =====
 function openSettings(){ shopUI.settingsOpen = true; }
+function openTrophies(){ shopUI.scroll = 0; game.scene = 'trophies'; }
 function closeSettings(){
   shopUI.settingsOpen = false;
   // cancel any pending reset confirmation when closing
@@ -655,6 +743,7 @@ const sfx = {
   phoenix(){ tone({f0:520, t:0.1, g:0.16}); tone({f0:780, t:0.1, g:0.16, when:0.08}); tone({f0:1040, f1:1560, t:0.18, g:0.16, when:0.16}); },
   ascend(){ tone({f0:520, t:0.12, g:0.16}); tone({f0:660, t:0.12, g:0.16, when:0.1}); tone({f0:880, t:0.14, g:0.16, when:0.2}); tone({f0:1320, f1:1760, t:0.3, g:0.14, when:0.3}); },
   buy(){ tone({f0:660, f1:990, type:'sine', t:0.09, g:0.13}); },
+  achieve(){ tone({f0:880, t:0.1, g:0.14}); tone({f0:1320, t:0.16, g:0.14, when:0.09}); },
 };
 
 // ===== haptics — gameplay-significant moments only =====
@@ -690,6 +779,8 @@ addEventListener('keydown', e=>{
       const idx = parseInt(k, 10) - 1;
       if (game.modifierPicks && game.modifierPicks[idx]) selectModifier(game.modifierPicks[idx]);
     }
+  } else if (game.scene==='trophies'){
+    if (k==='escape'||k==='b'||k==='m'){ game.scene = 'menu'; }
   } else if (game.scene==='shop'){
     // ascend modal absorbs Esc so it doesn't fall through to leaving the shop
     if (shopUI.ascendConfirm){
@@ -716,7 +807,7 @@ addEventListener('pointermove', e=>{
     touch.x = e.clientX;
     touch.y = e.clientY;
   }
-  if (game.scene === 'shop' && shopUI.dragging && e.pointerId === shopUI.pointerId){
+  if ((game.scene === 'shop' || game.scene === 'trophies') && shopUI.dragging && e.pointerId === shopUI.pointerId){
     const dy = e.clientY - shopUI.dragStartY;
     if (Math.abs(dy) > 6) shopUI.dragMoved = true;
     shopUI.scroll = clamp(shopUI.dragStartScroll - dy, 0, shopUI.maxScroll);
@@ -763,7 +854,7 @@ addEventListener('pointerdown', e=>{
     shopUI.dragMoved = false;
     shopUI.pointerId = e.pointerId;
     shopUI.candidate = hitButton(e.clientX, e.clientY);
-  } else if (game.scene === 'shop'){
+  } else if (game.scene === 'shop' || game.scene === 'trophies'){
     // capture for drag-or-tap; only fire on release if no drag
     shopUI.dragging = true;
     shopUI.dragStartY = e.clientY;
@@ -794,7 +885,7 @@ addEventListener('wheel', e=>{
   if (shopUI.pickerOpen && shopUI.pickerMaxScroll > 0){
     e.preventDefault();
     shopUI.pickerScroll = clamp(shopUI.pickerScroll + e.deltaY, 0, shopUI.pickerMaxScroll);
-  } else if (game.scene === 'shop' && shopUI.maxScroll > 0){
+  } else if ((game.scene === 'shop' || game.scene === 'trophies') && shopUI.maxScroll > 0){
     e.preventDefault();
     shopUI.scroll = clamp(shopUI.scroll + e.deltaY, 0, shopUI.maxScroll);
   }
@@ -1025,6 +1116,13 @@ function awardNearMiss(e, mult){
   sfx.near();
   // bigger gold feedback for the bonus case so player learns the back-pass mechanic
   if (mult > 1) ringBurst(e.x, e.y, '#facc15', 14);
+  // FRAGILE COMBO modifier — the close call you're rewarded for also shatters the combo
+  if (game.modifierFragileCombo && game.combo.tier > 0){
+    game.combo.breakFlash = 1;
+    game.combo.time = 0;
+    game.combo.mult = 1;
+    game.combo.tier = 0;
+  }
 
   // Edge passive — count toward threshold
   const edgeLvl = activePassiveLevel('edge');
@@ -1465,6 +1563,13 @@ function startRun(){
   game.modifierOrbBlock = false;
   game.modifierGlass = false;
   game.modifierNoPassives = false;
+  game.modifierBursts = false;
+  game.modifierFragileCombo = false;
+  game.isDaily = false;
+  // per-run achievement tracking
+  game.hitsTaken = 0;
+  game.maxComboTier = 0;
+  game.didBackPass = false;
   // resolve mode from meta, gated by prestige unlock thresholds (defensive — UI shouldn't allow
   // an unsupported choice but stale localStorage state could have a locked value).
   let dur = meta.preferredMode || 30;
@@ -1546,7 +1651,6 @@ function endRun(survived){
   const gained = Math.floor(baseGained * pMult * mMult * modeMult);
   meta.totalScore += gained;
   meta.totalEssence = (meta.totalEssence || 0) + game.runEssence;
-  saveMeta();
   game.result.survived = survived;
   game.result.time = elapsed;
   game.result.score = game.runScore;
@@ -1562,6 +1666,47 @@ function endRun(survived){
   game.result.cyan = game.cyanCount;
   game.result.white = game.whiteCount;
   game.result.gold = game.goldCount;
+  game.result.isDaily = !!game.isDaily;
+
+  // per-mode best (banked score) — every mode keeps its own target to beat
+  const modeKey = String(game.runDuration);
+  meta.bests = meta.bests || {};
+  game.result.modeBest = meta.bests[modeKey] || 0;
+  game.result.newBest = gained > (meta.bests[modeKey] || 0);
+  if (game.result.newBest) meta.bests[modeKey] = gained;
+
+  // modifier play history (SHAPESHIFTER achievement)
+  if (game.activeModifier){
+    meta.modifiersPlayed = meta.modifiersPlayed || {};
+    meta.modifiersPlayed[game.activeModifier.id] = true;
+  }
+
+  // daily completion — death counts; one attempt is one attempt
+  if (game.isDaily){
+    const today = todayStr();
+    const prev = meta.daily;
+    let streak = 1;
+    if (prev && prev.date){
+      const y = new Date(Date.now() - 86400000);
+      const yStr = y.getFullYear() + '-' + String(y.getMonth()+1).padStart(2,'0') + '-' + String(y.getDate()).padStart(2,'0');
+      if (prev.date === yStr) streak = (prev.streak || 1) + 1;
+      else if (prev.date === today) streak = prev.streak || 1;
+    }
+    meta.daily = { date: today, done: true, score: gained, best: Math.max(gained, (prev && prev.best) || 0), streak };
+    game.result.dailyStreak = streak;
+  }
+
+  // achievements last — checks read everything recorded above
+  game.result.newAchievements = checkAchievements({
+    r: game.result,
+    hitsTaken: game.hitsTaken || 0,
+    maxComboTier: game.maxComboTier || 0,
+    modifierId: game.activeModifier && game.activeModifier.id,
+    didBackPass: !!game.didBackPass,
+  });
+  if (game.result.newAchievements.length || game.result.newBest) sfx.achieve();
+
+  saveMeta();
   game.scene = 'result';
   game.resultTimer = 0;
 }
@@ -1687,6 +1832,7 @@ function update(dt){
   }
   cb.tier = newTier;
   cb.mult = newMult;
+  if (newTier > (game.maxComboTier || 0)) game.maxComboTier = newTier;
   if (game.comboToast && game.comboToast.t > 0) game.comboToast.t -= dt;
   if (cb.tierFlash > 0) cb.tierFlash = Math.max(0, cb.tierFlash - dt * 1.8);
   if (cb.breakFlash > 0) cb.breakFlash = Math.max(0, cb.breakFlash - dt * 1.6);
@@ -1757,13 +1903,20 @@ function update(dt){
   // tProg now uses wave-local progress so each wave's spawn ramp resets fresh.
   const waveTProg = 1 - (game.waveTimeLeft || game.timeLeft) / 30;
   const baseInterval = clamp(0.85 - waveTProg*0.43, 0.55, 0.95);
-  const interval = baseInterval / ((game.spawnRateMult || 1) * (game.modifierSpawnMult || 1));
+  let interval = baseInterval / ((game.spawnRateMult || 1) * (game.modifierSpawnMult || 1));
+  // BURSTS modifier: alternating 5s blocks — silence, then near-double tempo
+  let burstQuiet = false;
+  if (game.modifierBursts){
+    const waveElapsed = 30 - (game.waveTimeLeft || game.timeLeft);
+    if (Math.floor(waveElapsed / 5) % 2 === 1) burstQuiet = true;
+    else interval *= 0.55;
+  }
   // density cap: modifier override → wave-based default ([12, 14, 16] for waves 1/2/3) → MAX_DENSITY fallback.
   const waveCap = [12, 14, 16][(game.wave || 1) - 1] || MAX_DENSITY;
   const cap = game.modifierMaxDensity || waveCap;
   // skip spawn block during the brief wave-transition breath so the player gets a moment between waves
   if (game.waveTransitionTimer <= 0 && game.spawnTimer <= 0 && game.timeLeft > 0.3){
-    if (game.enemies.length >= cap){
+    if (burstQuiet || game.enemies.length >= cap){
       // capped — quick retry once enemies die or leave the arena.
       game.spawnTimer = 0.15;
     } else {
@@ -1824,7 +1977,7 @@ function update(dt){
           while (angleDiff > Math.PI) angleDiff -= TAU;
           while (angleDiff < -Math.PI) angleDiff += TAU;
           e.creditedNear = true;
-          if (Math.abs(angleDiff) >= Math.PI/3) awardNearMiss(e, 2);  // back-side only
+          if (Math.abs(angleDiff) >= Math.PI/3){ game.didBackPass = true; awardNearMiss(e, 2); }  // back-side only
         } else {
           e.creditedNear = true;
           awardNearMiss(e);
@@ -1862,6 +2015,7 @@ function damagePlayer(){
   }
 
   p.hp--;
+  game.hitsTaken = (game.hitsTaken || 0) + 1;
   p.recentLostSegment = p.hp; // 0-indexed: segment that just emptied
   p.damageFlash = 1;
   p.displayHp = p.hp / p.maxHp;
@@ -1946,6 +2100,10 @@ function render(){
     drawArenaBackdrop();
     drawArena(false);
     drawModifierPick();
+  } else if (game.scene === 'trophies'){
+    drawArenaBackdrop();
+    drawArena(false);
+    drawTrophies();
   } else {
     drawArenaBackdrop();
     drawArena(true);
@@ -2666,6 +2824,11 @@ function drawHUD(){
   ctx.fillStyle = danger ? '#ff9a3f' : '#e8ebf2';
   ctx.font = `300 italic 48px "Fraunces",serif`;
   ctx.fillText(tl.toFixed(1), CX, 86 + SAFE_T);
+  if (game.isDaily){
+    ctx.fillStyle = 'rgba(94,233,255,0.6)';
+    ctx.font = '300 9px "IBM Plex Mono",monospace';
+    ctx.fillText('· DAILY ·', CX, 100 + SAFE_T);
+  }
 
   // essence (top-left) — only after first pickup this run
   if (game.runEssence > 0){
@@ -2835,10 +2998,10 @@ function drawMenu(){
     by = ty + th;
   }
 
-  // ascension-available banner — first-time prestige unlock cue. Tappable, opens shop.
-  // Auto-dismisses once ascended (canAscend gates on prestige still being 0).
+  // ascension-available banner — first-time prestige unlock cue. Tappable, opens
+  // the prestige tab directly. Auto-dismisses once ascended.
   if (canAscend() && (meta.prestige || 0) === 0){
-    const bannerY = by + 16;
+    const bannerY = by + 12;
     const bannerW = narrow ? Math.min(280, W-48) : 360;
     const bannerH = 30;
     const bx = CX - bannerW/2;
@@ -2852,14 +3015,57 @@ function drawMenu(){
     ctx.fillStyle = `rgba(250,204,21,${0.7 + 0.3*pulse})`;
     ctx.font = '500 11px "IBM Plex Mono",monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('▲  ASCENSION  AVAILABLE  ·  visit  shop', CX, bannerY + 19);
-    game.buttonHits.push({x:bx, y:bannerY, w:bannerW, h:bannerH, action:openShop});
+    ctx.fillText('▲  ASCENSION  AVAILABLE', CX, bannerY + 19);
+    game.buttonHits.push({x:bx, y:bannerY, w:bannerW, h:bannerH, action:()=>{ shopUI.tab = 'prestige'; openShop(); }});
+    by = bannerY + bannerH;
+  }
+
+  // daily challenge — one attempt, same modifier for everyone today
+  {
+    const dm = dailyModifier();
+    const done = dailyDoneToday();
+    const dw = narrow ? Math.min(280, W-48) : 320;
+    const dh = 32;
+    const dx = CX - dw/2;
+    const dRowY = by + 12;
+    const hovD = !done && mx>=dx && mx<=dx+dw && my>=dRowY && my<=dRowY+dh;
+    ctx.fillStyle = done ? 'rgba(15,20,35,0.5)' : (hovD ? 'rgba(94,233,255,0.12)' : 'rgba(94,233,255,0.05)');
+    roundRect(dx, dRowY, dw, dh, 4);
+    ctx.fill();
+    ctx.strokeStyle = done ? 'rgba(232,235,242,0.15)' : 'rgba(94,233,255,0.5)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    ctx.fillStyle = done ? 'rgba(232,235,242,0.4)' : '#5ee9ff';
+    ctx.font = '500 10px "IBM Plex Mono",monospace';
+    ctx.fillText('DAILY', dx + 12, dRowY + 20);
+    ctx.textAlign = 'center';
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    if (done){
+      ctx.fillStyle = 'rgba(232,235,242,0.45)';
+      const streakTxt = (meta.daily && meta.daily.streak > 1) ? '  ·  streak ' + meta.daily.streak : '';
+      ctx.fillText('done · ' + formatScore(meta.daily.score) + streakTxt, CX + 16, dRowY + 20);
+    } else {
+      ctx.fillStyle = 'rgba(232,235,242,0.78)';
+      ctx.fillText(dm.title.replace(/\s+/g,' ') + '  ·  ×' + dm.scoreMult.toFixed(1) + ' score', CX + 16, dRowY + 20);
+      game.buttonHits.push({x:dx, y:dRowY, w:dw, h:dh, action:startDaily});
+    }
+    by = dRowY + dh;
   }
 
   // loadout — three slots showing equipped passives
   if (showLoadout){
     drawLoadout(by + 28, narrow);
   }
+
+  // dev mode (?dev=1) — testing shortcuts, never part of normal play
+  if (DEV){
+    drawButton(12, H - 50 - SAFE_B, 70, 32, '+P', ()=>{ meta.prestige = (meta.prestige||0) + 1; meta.prestigeMult = prestigeCurve(meta.prestige); saveMeta(); }, false);
+    drawButton(90, H - 50 - SAFE_B, 70, 32, '+$', ()=>{ meta.totalScore += 2000; meta.totalEssence = (meta.totalEssence||0) + 50; saveMeta(); }, false);
+  }
+
+  // trophy icon (left of the gear)
+  drawTrophyIcon();
 
   // best time / hint at the bottom
   const bottomY = showLoadout ? by + 130 : by + 60;
@@ -3314,6 +3520,97 @@ function drawResetRow(x, y, w, narrow){
 }
 
 // gear icon shown top-right of the menu and shop
+function drawTrophyIcon(){
+  const size = 28;
+  const x = W - 14 - size - 8 - size;   // sits left of the gear
+  const y = 14 + SAFE_T;
+  const hov = mx>=x && mx<=x+size && my>=y && my<=y+size;
+
+  ctx.strokeStyle = hov ? 'rgba(232,235,242,0.85)' : 'rgba(232,235,242,0.45)';
+  ctx.fillStyle = hov ? 'rgba(232,235,242,0.06)' : 'rgba(15,20,35,0.4)';
+  ctx.lineWidth = 1;
+  roundRect(x, y, size, size, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = hov ? '#facc15' : 'rgba(250,204,21,0.7)';
+  ctx.font = '300 14px "Fraunces",serif';
+  ctx.fillText('★', x + size/2, y + size/2 + 5);
+
+  game.buttonHits.push({ x, y, w:size, h:size, action: openTrophies });
+}
+
+function drawTrophies(){
+  ctx.fillStyle = 'rgba(6,8,16,0.65)';
+  ctx.fillRect(0,0,W,H);
+  const narrow = W < 540;
+  const earnedCount = ACHIEVEMENTS.filter(a => (meta.achievements||{})[a.id]).length;
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('— TROPHIES —', CX, narrow ? 36 : 56);
+  ctx.fillStyle = '#e8ebf2';
+  ctx.font = `300 italic ${narrow ? 28 : 40}px "Fraunces",serif`;
+  ctx.fillText(earnedCount + ' of ' + ACHIEVEMENTS.length, CX, narrow ? 68 : 100);
+  ctx.fillStyle = 'rgba(250,204,21,0.7)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('each trophy banks +' + ACHIEVEMENT_REWARD + ' essence', CX, narrow ? 86 : 122);
+
+  const listTop = narrow ? 102 : 142;
+  const backY = H - 70 - SAFE_B;
+  const listBottom = backY - 14;
+  const listH = Math.max(80, listBottom - listTop);
+  const rowH = 44;
+  const contentH = ACHIEVEMENTS.length * rowH + 8;
+  shopUI.maxScroll = Math.max(0, contentH - listH);
+  shopUI.scroll = clamp(shopUI.scroll, 0, shopUI.maxScroll);
+  const w = Math.min(420, W - 32);
+  const x = CX - w/2;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, listTop, W, listH);
+  ctx.clip();
+  let y = listTop + 4 - shopUI.scroll;
+  for (const a of ACHIEVEMENTS){
+    const got = !!(meta.achievements||{})[a.id];
+    ctx.fillStyle = got ? 'rgba(94,233,255,0.06)' : 'rgba(15,20,35,0.45)';
+    ctx.strokeStyle = got ? 'rgba(94,233,255,0.4)' : 'rgba(232,235,242,0.10)';
+    ctx.lineWidth = 1;
+    roundRect(x, y, w, rowH - 8, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    ctx.font = '300 16px "Fraunces",serif';
+    ctx.fillStyle = got ? '#facc15' : 'rgba(232,235,242,0.25)';
+    ctx.fillText(got ? '★' : '☆', x + 14, y + 24);
+    ctx.font = '500 11px "IBM Plex Mono",monospace';
+    ctx.fillStyle = got ? '#e8ebf2' : 'rgba(232,235,242,0.45)';
+    ctx.fillText(a.title, x + 40, y + 15);
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    ctx.fillStyle = got ? 'rgba(232,235,242,0.6)' : 'rgba(232,235,242,0.3)';
+    ctx.fillText(a.desc, x + 40, y + 29);
+    y += rowH;
+  }
+  ctx.restore();
+
+  // scrollbar
+  if (shopUI.maxScroll > 0){
+    const trackH = listH - 16;
+    const thumbH = Math.max(28, trackH * (listH / contentH));
+    const thumbY = listTop + 8 + (trackH - thumbH) * (shopUI.scroll / shopUI.maxScroll);
+    ctx.fillStyle = 'rgba(232,235,242,0.08)';
+    ctx.fillRect(W - 7, listTop + 8, 2, trackH);
+    ctx.fillStyle = 'rgba(94,233,255,0.55)';
+    ctx.fillRect(W - 7, thumbY, 2, thumbH);
+  }
+
+  const backW = narrow ? Math.min(280, W-48) : 240;
+  drawButton(CX - backW/2, backY, backW, 44, 'BACK  TO  MENU', ()=>{ game.scene = 'menu'; }, false);
+}
+
 function drawGearIcon(){
   const size = 28;
   const x = W - 14 - size;
@@ -3417,9 +3714,7 @@ function drawShop(){
   // grid layout
   const cols = narrow ? 2 : 3;
   const items = shopUI.tab === 'passives' ? PASSIVES : META_UPGRADES;
-  const includeAscend = shopUI.tab === 'stats';  // ASCEND card pinned to bottom of stats grid
-  const totalItems = items.length + (includeAscend ? 1 : 0);
-  const rows = Math.ceil(totalItems / cols);
+  const rows = Math.ceil(items.length / cols);
   const gx = narrow ? 12 : 24;
   const gy = narrow ? 12 : 24;
   const maxCardW = narrow ? 180 : 220;
@@ -3444,7 +3739,11 @@ function drawShop(){
   ctx.rect(0, cardsAreaTop, W, cardsAreaH);
   ctx.clip();
 
-  if (shopUI.tab === 'passives'){
+  if (shopUI.tab === 'prestige'){
+    shopUI.maxScroll = 0;
+    shopUI.scroll = 0;
+    drawPrestigePanel(cardsAreaTop, cardsAreaBottom, narrow);
+  } else if (shopUI.tab === 'passives'){
     for (let i=0;i<PASSIVES.length;i++){
       const p = PASSIVES[i];
       const col = i%cols, row = Math.floor(i/cols);
@@ -3460,12 +3759,6 @@ function drawShop(){
       const y = startY + row*(cardH+gy);
       drawShopCard(x, y, cardW, cardH, u, cardsAreaTop, cardsAreaBottom);
     }
-    // ASCEND card — pinned at the bottom of the stats grid
-    const ai = META_UPGRADES.length;
-    const acol = ai%cols, arow = Math.floor(ai/cols);
-    const ax = startX + acol*(cardW+gx);
-    const ay = startY + arow*(cardH+gy);
-    drawAscendCard(ax, ay, cardW, cardH, cardsAreaTop, cardsAreaBottom);
   }
 
   ctx.restore();
@@ -3514,100 +3807,84 @@ function drawShop(){
   }
 }
 
-function drawAscendCard(x, y, w, h, areaTop, areaBottom){
-  const available = canAscend();
-  const tight = w < 200;
-  const padX = tight ? 12 : 18;
-  const symSize = tight ? 18 : 22;
-  const titleSize = tight ? 11 : 13;
-  const descSize = tight ? 10 : 11;
-  const lh = tight ? 12 : 14;
+// Prestige tab — dedicated surface for rank, ascension, and the unlock ladder.
+// The ladder is the game's visible sense of direction: every rank points at the
+// next thing prestige buys you, not just a bigger multiplier.
+function drawPrestigePanel(top, bottom, narrow){
+  const p = meta.prestige || 0;
+  const mult = meta.prestigeMult || 1;
+  let y = top + (narrow ? 30 : 42);
 
-  const hov = mx>=x && mx<=x+w && my>=y && my<=y+h;
-  const pulse = 0.6 + 0.4 * Math.sin(game.t * 1.6);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#facc15';
+  ctx.font = `300 italic ${narrow ? 34 : 44}px "Fraunces",serif`;
+  ctx.fillText('Rank ' + p, CX, y);
+  y += narrow ? 22 : 26;
+  ctx.fillStyle = 'rgba(232,235,242,0.6)';
+  ctx.font = '300 11px "IBM Plex Mono",monospace';
+  ctx.fillText('permanent score multiplier  ' + mult.toFixed(2) + 'x', CX, y);
+  y += narrow ? 28 : 32;
 
-  // gold-themed visuals to distinguish from cyan stat upgrades
-  if (available && hov){
-    ctx.fillStyle = `rgba(250,204,21,${0.10 + 0.06*pulse})`;
-    ctx.strokeStyle = '#facc15';
-    ctx.shadowColor = '#facc15';
-    ctx.shadowBlur = 18;
-  } else if (available){
-    ctx.fillStyle = 'rgba(40,30,8,0.78)';
-    ctx.strokeStyle = `rgba(250,204,21,${0.35 + 0.15*pulse})`;
+  // progress toward the next ascension
+  const owned = totalStatLevels();
+  const ready = canAscend();
+  const barW = Math.min(300, W - 64);
+  ctx.fillStyle = 'rgba(232,235,242,0.5)';
+  ctx.font = '300 10px "IBM Plex Mono",monospace';
+  ctx.fillText('stat levels owned  ' + owned + ' / 12', CX, y);
+  y += 10;
+  ctx.fillStyle = 'rgba(232,235,242,0.12)';
+  ctx.fillRect(CX - barW/2, y, barW, 4);
+  ctx.fillStyle = '#facc15';
+  ctx.fillRect(CX - barW/2, y, barW * clamp(owned/12, 0, 1), 4);
+  y += 24;
+
+  // ascend button (or its locked explanation)
+  const bw = narrow ? Math.min(260, W-64) : 280;
+  const bh = 42;
+  if (ready){
+    const next = prestigeCurve(p + 1);
+    drawButton(CX - bw/2, y, bw, bh, 'ASCEND  →  ' + next.toFixed(2) + 'x', ()=>{ shopUI.ascendConfirm = true; }, true);
   } else {
     ctx.fillStyle = 'rgba(15,20,35,0.5)';
-    ctx.strokeStyle = 'rgba(232,235,242,0.12)';
+    roundRect(CX - bw/2, y, bw, bh, 4);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(232,235,242,0.15)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(232,235,242,0.4)';
+    ctx.font = '500 10px "IBM Plex Mono",monospace';
+    ctx.fillText('ASCEND  ·  own 12 stat levels first', CX, y + 26);
   }
-  ctx.lineWidth = (available && hov) ? 1.5 : 1;
-  roundRect(x, y, w, h, 4);
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.stroke();
+  y += bh + (narrow ? 24 : 30);
 
-  ctx.textAlign = 'left';
-  ctx.fillStyle = available ? '#facc15' : 'rgba(232,235,242,0.3)';
-  ctx.font = `300 ${symSize}px "Fraunces",serif`;
-  ctx.fillText('▲', x+padX, y + (tight ? 26 : 30));
-
-  ctx.fillStyle = available ? '#fff' : 'rgba(232,235,242,0.4)';
-  ctx.font = `500 ${titleSize}px "IBM Plex Mono",monospace`;
-  ctx.fillText('ASCEND', x + padX + (tight ? 22 : 26), y + (tight ? 24 : 28));
-
-  ctx.fillStyle = available ? 'rgba(232,235,242,0.7)' : 'rgba(232,235,242,0.3)';
-  ctx.font = `300 ${descSize}px "IBM Plex Mono",monospace`;
-
-  const owned = totalStatLevels();
-  let descLines;
-  if (available){
-    const nextRank = (meta.prestige || 0) + 1;
-    const nextMult = prestigeCurve(nextRank);
-    const curMult = meta.prestigeMult || 1;
-    const gainPct = ((nextMult - curMult) * 100).toFixed(1);
-    descLines = [
-      'Reset stats. Keep passives.',
-      'Permanent score multiplier:',
-      curMult.toFixed(2) + 'x  →  ' + nextMult.toFixed(2) + 'x  (+' + gainPct + '%)',
-    ];
-  } else {
-    descLines = [
-      'First ascension unlocks at',
-      '12 stat levels owned.',
-      owned + ' / 12 levels owned',
-    ];
+  // unlock ladder
+  ctx.fillStyle = 'rgba(94,233,255,0.55)';
+  ctx.font = '500 9px "IBM Plex Mono",monospace';
+  ctx.fillText('— THE  LADDER —', CX, y);
+  y += 18;
+  const LADDER = [
+    { at: 2,  label: 'gold aura during play' },
+    { at: 4,  label: 'per-run modifiers' },
+    { at: 6,  label: '60s · EXTENDED mode' },
+    { at: 12, label: '90s · ENDURANCE mode' },
+  ];
+  let nextMarked = false;
+  for (const step of LADDER){
+    const got = p >= step.at;
+    const isNext = !got && !nextMarked;
+    if (isNext) nextMarked = true;
+    ctx.font = isNext ? '500 11px "IBM Plex Mono",monospace' : '300 11px "IBM Plex Mono",monospace';
+    ctx.fillStyle = got ? 'rgba(94,233,255,0.85)' : (isNext ? '#facc15' : 'rgba(232,235,242,0.35)');
+    ctx.fillText((got ? '✓   ' : (isNext ? '›   ' : '·   ')) + 'P' + step.at + '   ' + step.label, CX, y);
+    y += 19;
   }
-  for (let i=0;i<descLines.length;i++){
-    ctx.fillText(descLines[i], x+padX, y + (tight ? 44 : 52) + i*lh);
-  }
+  y += 14;
 
-  // bottom-right: rank badge if available, progress bar if locked
-  ctx.textAlign = 'right';
-  if (available){
-    ctx.fillStyle = '#facc15';
-    ctx.font = `500 ${tight?12:13}px "IBM Plex Mono",monospace`;
-    ctx.fillText('▲ P' + ((meta.prestige || 0) + 1), x+w-padX, y+h-(tight?14:17));
-  } else {
-    const pct = clamp(owned / 12, 0, 1);
-    const barW = w - padX*2;
-    const barH = 3;
-    const barX = x + padX;
-    const barY = y + h - (tight ? 14 : 18);
-    ctx.fillStyle = 'rgba(232,235,242,0.12)';
-    ctx.fillRect(barX, barY, barW, barH);
-    ctx.fillStyle = '#facc15';
-    ctx.fillRect(barX, barY, barW * pct, barH);
-  }
-
-  if (available){
-    const top = areaTop !== undefined ? Math.max(y, areaTop) : y;
-    const bot = areaBottom !== undefined ? Math.min(y+h, areaBottom) : (y+h);
-    const visH = bot - top;
-    if (visH >= 28){
-      game.buttonHits.push({x, y:top, w, h:visH, action:()=>{
-        shopUI.ascendConfirm = true;
-      }});
-    }
-  }
+  ctx.fillStyle = 'rgba(232,235,242,0.35)';
+  ctx.font = '300 9px "IBM Plex Mono",monospace';
+  ctx.fillText('ascending resets stat upgrades & banked score', CX, y);
+  ctx.fillText('passives, essence and trophies are kept', CX, y + 13);
 }
 
 function drawAscendConfirm(narrow){
@@ -3700,9 +3977,10 @@ function drawShopTabs(y, narrow){
   const labels = [
     { id:'stats', text:'STATS', currency:'score' },
     { id:'passives', text:'PASSIVES', currency:'essence' },
+    { id:'prestige', text:'PRESTIGE', currency:'ascend' },
   ];
-  const tabW = narrow ? 130 : 160;
-  const gap = narrow ? 8 : 14;
+  const gap = narrow ? 6 : 14;
+  const tabW = narrow ? Math.min(110, (W - 32 - gap*2) / 3) : 150;
   const totalW = tabW * labels.length + gap * (labels.length-1);
   const startX = CX - totalW/2;
   for (let i=0;i<labels.length;i++){
@@ -4194,27 +4472,63 @@ function drawResult(){
   ctx.font = '300 10px "IBM Plex Mono",monospace';
   ctx.fillText(formatScore(meta.totalScore) + ' score · ' + (meta.totalEssence||0) + ' essence banked', CX, CY + 30);
 
+  // per-mode best, daily, and trophy lines — these push the layout below them down
+  let extraY = 0;
+  if (r.newBest){
+    const pulse = 0.7 + 0.3 * Math.sin(game.resultTimer * 6);
+    ctx.fillStyle = `rgba(250,204,21,${pulse})`;
+    ctx.font = '500 italic 13px "Fraunces",serif';
+    ctx.fillText('NEW  ' + (r.runDuration||30) + 's  BEST', CX, CY + 48);
+    extraY += 17;
+  } else if (r.modeBest > 0){
+    ctx.fillStyle = 'rgba(232,235,242,0.35)';
+    ctx.font = '300 9px "IBM Plex Mono",monospace';
+    ctx.fillText((r.runDuration||30) + 's best · ' + formatScore(r.modeBest), CX, CY + 46);
+    extraY += 14;
+  }
+  if (r.isDaily){
+    ctx.fillStyle = 'rgba(94,233,255,0.8)';
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    const streakTxt = r.dailyStreak > 1 ? '  ·  streak ' + r.dailyStreak : '';
+    ctx.fillText('DAILY  COMPLETE' + streakTxt + '  ·  back tomorrow', CX, CY + 32 + extraY + 14);
+    extraY += 14;
+  }
+  if (r.newAchievements && r.newAchievements.length){
+    ctx.font = '300 10px "IBM Plex Mono",monospace';
+    const show = r.newAchievements.slice(0, 2);
+    for (const a of show){
+      ctx.fillStyle = '#facc15';
+      ctx.fillText('★  ' + a.title + '  ·  +' + ACHIEVEMENT_REWARD + ' essence', CX, CY + 32 + extraY + 14);
+      extraY += 14;
+    }
+    if (r.newAchievements.length > 2){
+      ctx.fillStyle = 'rgba(250,204,21,0.6)';
+      ctx.fillText('+ ' + (r.newAchievements.length - 2) + ' more trophies', CX, CY + 32 + extraY + 13);
+      extraY += 13;
+    }
+  }
+
   // orb key (always shown, with breathing room above)
-  drawOrbKey(CY + 78, narrow);
+  drawOrbKey(CY + 78 + extraY, narrow);
 
   // buttons
   if (narrow){
     const bw = Math.min(280, W-48), bh = 44;
-    const by = CY + 188;
+    const by = CY + 188 + extraY;
     drawButton(CX-bw/2, by, bw, bh, 'DESCEND  AGAIN', beginRun, true);
     drawButton(CX-bw/2, by + bh + 10, bw, bh, 'UPGRADES', openShop, false);
   } else {
     const bw = 180, bh = 44, gap = 16;
     const totalW = bw*2 + gap;
     const baseX = CX - totalW/2;
-    const by = CY + 188;
+    const by = CY + 188 + extraY;
     drawButton(baseX, by, bw, bh, 'DESCEND  AGAIN', beginRun, true);
     drawButton(baseX+bw+gap, by, bw, bh, 'UPGRADES', openShop, false);
   }
 
   ctx.fillStyle = 'rgba(232,235,242,0.3)';
   ctx.font = '300 10px "IBM Plex Mono",monospace';
-  const hintY = narrow ? CY + 296 : CY + 256;
+  const hintY = (narrow ? CY + 296 : CY + 256) + extraY;
   ctx.fillText(narrow ? 'tap to continue' : 'SPACE  retry  ·  U  upgrades  ·  M  menu', CX, hintY);
 
   ctx.globalAlpha = 1;

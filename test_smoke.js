@@ -47,8 +47,8 @@ global.requestAnimationFrame = () => {};
 global.getComputedStyle = () => ({ getPropertyValue: () => '0px' });
 
 // expose internals for the test driver
-src += `;globalThis.__T = { game, meta, shopUI, MODIFIERS, COMBO_TIERS,
-  startRun, endRun, beginRun, selectModifier, update, render, ascend, canAscend, totalStatLevels, damagePlayer };`;
+src += `;globalThis.__T = { game, meta, shopUI, MODIFIERS, COMBO_TIERS, ACHIEVEMENTS,
+  startRun, endRun, beginRun, selectModifier, update, render, ascend, canAscend, totalStatLevels, damagePlayer, startDaily };`;
 
 let step = 'eval';
 const results = [];
@@ -125,6 +125,61 @@ try {
   T.ascend();
   if (T.meta.prestige !== 1) throw new Error('prestige=' + T.meta.prestige);
   if (Object.keys(T.meta.owned).length !== 0) throw new Error('owned not wiped');
+  pass(step);
+} catch(e){ fail(step, e); }
+
+try {
+  step='no free prestige: 12 levels required EVERY ascension';
+  // 'ascend flow' just wiped owned; at P1 with 0 levels canAscend must be false
+  T.game.scene = 'menu';
+  if (T.canAscend()) throw new Error('canAscend true with 0 levels at P>=1');
+  T.meta.owned = { vitality:3, swiftness:5, compact:4 };
+  if (!T.canAscend()) throw new Error('canAscend false with 12 levels');
+  T.meta.owned = {};
+  pass(step);
+} catch(e){ fail(step, e); }
+
+try {
+  step='daily challenge: start, modifier applied, finish, locks';
+  T.meta.prestige = 0; T.meta.preferredMode = 30;
+  T.game.scene = 'menu';
+  T.startDaily();
+  if (T.game.scene !== 'playing') throw new Error('scene=' + T.game.scene);
+  if (!T.game.activeModifier) throw new Error('no daily modifier');
+  if (!T.game.isDaily) throw new Error('isDaily not set');
+  for (let i=0;i<90;i++){ T.update(1/60); }
+  const essBefore = T.meta.totalEssence;
+  T.endRun(false);
+  if (!T.meta.daily || !T.meta.daily.done) throw new Error('daily not recorded');
+  if (!T.meta.achievements.ritual) throw new Error('ritual not earned');
+  if (!(T.meta.totalEssence > essBefore)) throw new Error('no trophy essence');
+  if (!(T.meta.bests['30'] > 0)) throw new Error('mode best not recorded');
+  T.game.resultTimer = 1; T.render();   // result with daily + trophy lines
+  T.game.scene = 'menu';
+  T.startDaily();
+  if (T.game.scene === 'playing') throw new Error('daily replay not blocked');
+  T.render();   // menu with daily-done row
+  pass(step);
+} catch(e){ fail(step, e); }
+
+try {
+  step='new modifiers apply (DRAG, FRAGILE, BURSTS)';
+  T.selectModifier(T.MODIFIERS.find(x=>x.id==='drag'));
+  if (T.game.modifierEnemySpeedMult !== 0.8) throw new Error('drag speed=' + T.game.modifierEnemySpeedMult);
+  T.selectModifier(T.MODIFIERS.find(x=>x.id==='fragile'));
+  if (!T.game.modifierFragileCombo) throw new Error('fragile flag not set');
+  T.selectModifier(T.MODIFIERS.find(x=>x.id==='bursts'));
+  if (!T.game.modifierBursts) throw new Error('bursts flag not set');
+  for (let i=0;i<150;i++){ T.update(1/60); }   // crosses a quiet/dense boundary
+  pass(step);
+} catch(e){ fail(step, e); }
+
+try {
+  step='prestige tab + trophies scene render';
+  T.game.scene = 'shop'; T.shopUI.tab = 'prestige'; T.render();
+  T.shopUI.tab = 'stats';
+  T.game.scene = 'trophies'; T.render();
+  T.game.scene = 'menu'; T.render();
   pass(step);
 } catch(e){ fail(step, e); }
 
